@@ -1,72 +1,80 @@
 import numpy as np
-import faiss
+import scipy.sparse as sp
 import pandas as pd
 import config
 from embedder import Embedder
 from data_utils import load_corpus
 
 
-class FaissIndexer:
+class SparseIndexer:
     """
-    Build, save, load, and search a FAISS flat inner-product index.
-    Since embeddings are L2-normalized, inner product == cosine similarity.
+    Build, save, load, and search a scipy CSR sparse index from MILCO embeddings.
+
+    Index shape: (n_docs, vocab_size) — typically ~500 MB for 1M docs.
+    Search: query_sparse @ index.T  →  (n_queries, n_docs) scores.
     """
 
     def __init__(self):
-        self.index = None
+        self.index: sp.csr_matrix | None = None
         self.citations: list[str] = []
 
     def build(self, corpus: pd.DataFrame, embedder: Embedder):
-        """Embed corpus texts and build FAISS index."""
         print("[indexer] encoding corpus ...")
         texts = corpus["text"].tolist()
         self.citations = corpus["citation"].tolist()
 
-        embeddings = embedder.encode_corpus(texts)
-
-        dim = embeddings.shape[1]
-        print(f"[indexer] building FAISS IndexFlatIP (dim={dim}) ...")
-        self.index = faiss.IndexFlatIP(dim)
-        self.index.add(embeddings)
-        print(f"[indexer] index built: {self.index.ntotal} vectors")
+        self.index = embedder.encode_corpus(texts)
+        print(
+            f"[indexer] index built: {self.index.shape[0]:,} docs, "
+            f"vocab={self.index.shape[1]:,}, "
+            f"nnz={self.index.nnz:,}"
+        )
 
     def save(self):
         config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(self.index, str(config.FAISS_INDEX_PATH))
+        sp.save_npz(str(config.SPARSE_INDEX_PATH), self.index)
         np.save(str(config.CORPUS_CITATIONS_PATH), np.array(self.citations))
-        print(f"[indexer] saved → {config.FAISS_INDEX_PATH}")
+        print(f"[indexer] saved → {config.SPARSE_INDEX_PATH}")
 
     def load(self):
-        print(f"[indexer] loading index from {config.FAISS_INDEX_PATH} ...")
-        self.index = faiss.read_index(str(config.FAISS_INDEX_PATH))
+        print(f"[indexer] loading from {config.SPARSE_INDEX_PATH} ...")
+        self.index = sp.load_npz(str(config.SPARSE_INDEX_PATH))
         self.citations = np.load(
             str(config.CORPUS_CITATIONS_PATH), allow_pickle=True
         ).tolist()
-        print(f"[indexer] loaded {self.index.ntotal} vectors")
+        print(f"[indexer] loaded {self.index.shape[0]:,} docs")
 
     def search(
-        self, query_embeddings: np.ndarray, top_k: int = config.RETRIEVAL_TOP_K
-    ) -> tuple[np.ndarray, np.ndarray]:
+        self, query_sparse: sp.csr_matrix, top_k: int = config.RETRIEVAL_TOP_K
+    ) -> tuple[list[list[str]], np.ndarray]:
         """
-        Returns:
-            scores  : (n_queries, top_k) float32
-            indices : (n_queries, top_k) int64
-        """
-        scores, indices = self.index.search(query_embeddings, top_k)
-        return scores, indices
+        Score all docs against each query and return top-k.
 
-    def get_citations(self, indices: np.ndarray) -> list[list[str]]:
-        """Convert index positions → citation strings."""
-        return [
-            [self.citations[i] for i in row if i >= 0]
-            for row in indices
-        ]
+        Returns:
+            citations : (n_queries,) list of top-k citation strings
+            scores    : (n_queries, top_k) float32 scores
+        """
+        # (n_queries, n_docs) — sparse dot product
+        scores_matrix = (query_sparse @ self.index.T).toarray().astype(np.float32)
+
+        top_k_actual = min(top_k, scores_matrix.shape[1])
+        # argpartition: top-k (unordered), then sort
+        top_idx = np.argpartition(scores_matrix, -top_k_actual, axis=1)[:, -top_k_actual:]
+
+        all_citations, all_scores = [], []
+        for i, idx_row in enumerate(top_idx):
+            order = np.argsort(scores_matrix[i, idx_row])[::-1]
+            sorted_idx = idx_row[order]
+            all_citations.append([self.citations[j] for j in sorted_idx])
+            all_scores.append(scores_matrix[i, sorted_idx])
+
+        return all_citations, np.array(all_scores)
 
 
 if __name__ == "__main__":
     corpus = load_corpus()
     embedder = Embedder()
-    indexer = FaissIndexer()
+    indexer = SparseIndexer()
     indexer.build(corpus, embedder)
     indexer.save()
-    print("Index built and saved.")
+    print("Sparse index built and saved.")

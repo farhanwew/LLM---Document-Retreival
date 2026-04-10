@@ -1,19 +1,20 @@
 """
-Full retrieval pipeline: embed queries → FAISS search → adaptive threshold.
+Retrieval pipeline: MILCO sparse encoding → sparse dot product → adaptive cutoff.
 
-Modes (python src/retriever.py --mode <mode>):
-  build_index  — embed corpus and build FAISS index (run once)
-  tune_k       — try fixed k values on val.csv
-  baseline     — tune k on val then generate submission
+Modes:
+  build_index  — encode corpus and save sparse index (run once)
+  tune_k       — try threshold settings on val.csv
+  baseline     — tune then generate submission
   submit       — generate submission with given --k
 """
 import argparse
-import pandas as pd
 import numpy as np
+import pandas as pd
+import scipy.sparse as sp
 from pathlib import Path
 import config
 from embedder import Embedder
-from indexer import FaissIndexer
+from indexer import SparseIndexer
 from data_utils import load_val, load_test, parse_citations
 from evaluate import macro_f1
 
@@ -21,10 +22,10 @@ from evaluate import macro_f1
 class Retriever:
     def __init__(self, model_path: str = config.BASE_MODEL):
         self.embedder = Embedder(model_path)
-        self.indexer = FaissIndexer()
+        self.indexer = SparseIndexer()
 
     def build_index(self):
-        """Embed corpus and build FAISS index. Run once offline."""
+        """Encode corpus and build sparse index. Run once offline."""
         from data_utils import load_corpus
         corpus = load_corpus()
         self.indexer.build(corpus, self.embedder)
@@ -40,70 +41,67 @@ class Retriever:
         adaptive: bool = True,
         gap_fraction: float = config.ADAPTIVE_GAP_FRACTION,
     ) -> list[list[str]]:
-        """
-        Retrieve citations for each query.
-
-        If adaptive=True, uses a score-gap heuristic to decide how many
-        citations to return per query (better Macro F1 than fixed k).
-        If adaptive=False, returns exactly top_k citations.
-        """
-        query_embs = self.embedder.encode_queries(queries)
-        scores, indices = self.indexer.search(query_embs, top_k=top_k)
-        all_citations = self.indexer.get_citations(indices)
+        query_sparse = self.embedder.encode_queries(queries)
+        all_citations, all_scores = self.indexer.search(query_sparse, top_k=top_k)
 
         if not adaptive:
-            return all_citations
+            return [cits[:config.FINAL_TOP_K] for cits in all_citations]
 
         return [
             _adaptive_cutoff(cits, scrs, gap_fraction)
-            for cits, scrs in zip(all_citations, scores)
+            for cits, scrs in zip(all_citations, all_scores)
         ]
 
-    def tune_k_on_val(self, k_values: list[int] = [5, 10, 15, 20, 30]):
-        """Try fixed k values on val.csv and report Macro F1."""
+    def tune_on_val(self, gap_values: list[float] = [0.05, 0.10, 0.15, 0.20, 0.25]):
+        """Try adaptive gap fractions + fixed top-k on val.csv."""
         val = load_val()
         queries = val["query"].tolist()
         gold_list = [parse_citations(g) for g in val["gold_citations"]]
 
-        # Embed once, reuse for all k values
-        query_embs = self.embedder.encode_queries(queries)
-        scores, indices = self.indexer.search(query_embs, top_k=max(k_values))
-        citations_list = self.indexer.get_citations(indices)
+        # Encode once, reuse
+        query_sparse = self.embedder.encode_queries(queries)
+        all_citations, all_scores = self.indexer.search(
+            query_sparse, top_k=config.RETRIEVAL_TOP_K
+        )
 
-        print(f"\n{'k':>5} | {'Macro F1':>10}")
-        print("-" * 20)
-        best_k, best_f1 = k_values[0], 0.0
-        for k in k_values:
-            preds = [cits[:k] for cits in citations_list]
+        print(f"\n{'setting':>12} | {'Macro F1':>10}")
+        print("-" * 28)
+
+        best_setting, best_f1 = None, 0.0
+
+        # Fixed top-k
+        for k in [5, 10, 15, 20]:
+            preds = [cits[:k] for cits in all_citations]
             f1 = macro_f1(gold_list, preds)
-            print(f"{k:>5} | {f1:>10.4f}")
+            print(f"{'top-'+str(k):>12} | {f1:>10.4f}")
             if f1 > best_f1:
-                best_f1, best_k = f1, k
+                best_f1, best_setting = f1, ("fixed", k)
 
-        # Also try adaptive threshold
-        adaptive_preds = [
-            _adaptive_cutoff(cits, scrs, config.ADAPTIVE_GAP_FRACTION)
-            for cits, scrs in zip(citations_list, scores)
-        ]
-        adaptive_f1 = macro_f1(gold_list, adaptive_preds)
-        print(f"{'auto':>5} | {adaptive_f1:>10.4f}  (adaptive gap={config.ADAPTIVE_GAP_FRACTION})")
+        # Adaptive gap
+        for gap in gap_values:
+            preds = [
+                _adaptive_cutoff(cits, scrs, gap)
+                for cits, scrs in zip(all_citations, all_scores)
+            ]
+            f1 = macro_f1(gold_list, preds)
+            print(f"{'gap='+str(gap):>12} | {f1:>10.4f}")
+            if f1 > best_f1:
+                best_f1, best_setting = f1, ("adaptive", gap)
 
-        if adaptive_f1 > best_f1:
-            print(f"\n→ Best = adaptive (F1 = {adaptive_f1:.4f})")
-        else:
-            print(f"\n→ Best k = {best_k} (F1 = {best_f1:.4f})")
-        return best_k
+        print(f"\n→ Best: {best_setting} (F1 = {best_f1:.4f})")
+        return best_setting
 
     def generate_submission(
         self,
         top_k: int = config.RETRIEVAL_TOP_K,
         adaptive: bool = True,
+        gap_fraction: float = config.ADAPTIVE_GAP_FRACTION,
         output_path: Path = config.SUBMISSION_PATH,
     ):
         test = load_test()
         queries = test["query"].tolist()
-        print(f"[submit] retrieving for {len(queries)} test queries ...")
-        preds = self.retrieve(queries, top_k=top_k, adaptive=adaptive)
+        print(f"[submit] retrieving for {len(queries)} queries ...")
+        preds = self.retrieve(queries, top_k=top_k, adaptive=adaptive, gap_fraction=gap_fraction)
 
         config.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
         rows = [
@@ -121,26 +119,18 @@ def _adaptive_cutoff(
     scores: np.ndarray,
     gap_fraction: float,
 ) -> list[str]:
-    """
-    Return citations up to the largest score drop.
-
-    Finds the biggest absolute gap between consecutive scores that also
-    exceeds gap_fraction * top_score. Falls back to all citations if
-    no significant gap is found. Always returns at least 1 citation.
-    """
+    """Return citations up to the largest score gap > gap_fraction * top_score."""
     if len(citations) <= 1:
         return citations
 
     top_score = float(scores[0])
     threshold = gap_fraction * top_score
-    best_cut = len(citations)  # default: return all
-    best_gap = 0.0
+    best_cut, best_gap = len(citations), 0.0
 
     for i in range(len(citations) - 1):
         gap = float(scores[i]) - float(scores[i + 1])
         if gap > threshold and gap > best_gap:
-            best_gap = gap
-            best_cut = i + 1
+            best_gap, best_cut = gap, i + 1
 
     return citations[:best_cut]
 
@@ -154,6 +144,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--model", default=config.BASE_MODEL)
     parser.add_argument("--k", type=int, default=config.RETRIEVAL_TOP_K)
+    parser.add_argument("--gap", type=float, default=config.ADAPTIVE_GAP_FRACTION)
     args = parser.parse_args()
 
     retriever = Retriever(model_path=args.model)
@@ -163,13 +154,17 @@ if __name__ == "__main__":
 
     elif args.mode == "tune_k":
         retriever.load_index()
-        retriever.tune_k_on_val()
+        retriever.tune_on_val()
 
     elif args.mode == "baseline":
         retriever.load_index()
-        best_k = retriever.tune_k_on_val()
-        retriever.generate_submission(top_k=best_k)
+        best = retriever.tune_on_val()
+        kind, val = best
+        if kind == "fixed":
+            retriever.generate_submission(top_k=val, adaptive=False)
+        else:
+            retriever.generate_submission(adaptive=True, gap_fraction=val)
 
     elif args.mode == "submit":
         retriever.load_index()
-        retriever.generate_submission(top_k=args.k)
+        retriever.generate_submission(top_k=args.k, gap_fraction=args.gap)

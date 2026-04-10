@@ -3,7 +3,9 @@
     "allow": [
       "Bash(rm config.py data_utils.py embedder.py indexer.py retriever.py hard_negative.py trainer.py evaluate.py submission_notebook.ipynb)",
       "Bash(touch data/.gitkeep models/.gitkeep outputs/.gitkeep)",
-      "Bash(mkdir -p data models outputs)"
+      "Bash(mkdir -p data models outputs)",
+      "Bash(python:*)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }
