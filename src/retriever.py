@@ -48,9 +48,13 @@ class Retriever:
           2. MILCO rerank candidates
           3. Adaptive cutoff → final citations
         """
+        # BM25 batch search — one call for all queries
+        batch_candidates = self.bm25.search_batch(queries, top_k=bm25_top_k)
+
         results = []
-        for query in tqdm(queries, desc="retrieving"):
-            candidates = self.bm25.search(query, top_k=bm25_top_k)
+        for query, candidates in tqdm(
+            zip(queries, batch_candidates), total=len(queries), desc="retrieving"
+        ):
             if not candidates:
                 results.append([])
                 continue
@@ -83,9 +87,14 @@ class Retriever:
         gold_list = [parse_citations(g) for g in val["gold_citations"]]
 
         # BM25 + MILCO once, then try different cutoffs
+        # BM25 batch search — one call for all queries
+        print("[tune] BM25 batch search ...")
+        batch_candidates = self.bm25.search_batch(queries, top_k=config.BM25_TOP_K)
+
         all_citations, all_scores = [], []
-        for query in tqdm(queries, desc="tuning"):
-            candidates = self.bm25.search(query, top_k=config.BM25_TOP_K)
+        for query, candidates in tqdm(
+            zip(queries, batch_candidates), total=len(queries), desc="MILCO reranking"
+        ):
             texts = [c["text"] for c in candidates]
             citations = [c["citation"] for c in candidates]
 
