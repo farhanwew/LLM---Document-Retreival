@@ -36,4 +36,4 @@ FINAL_TOP_K = 20              # after adaptive cutoff
 ADAPTIVE_GAP_FRACTION = 0.15
 
 # ── Encoding ───────────────────────────────────────────────────────────────
-ENCODE_BATCH_SIZE = 128
+ENCODE_BATCH_SIZE = 16   # MILCO 650m MLM head is memory-heavy; 16 safe on 22GB GPU

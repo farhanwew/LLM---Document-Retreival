@@ -54,6 +54,7 @@ class Embedder:
                 sparse_out = self.model.encode_document(batch)
 
             sparse_out = sparse_out.coalesce().cpu()
+            torch.cuda.empty_cache()
             indices = sparse_out.indices().numpy()  # (2, nnz)
             values = sparse_out.values().numpy()    # (nnz,)
 
