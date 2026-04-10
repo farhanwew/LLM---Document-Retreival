@@ -12,28 +12,23 @@ TEST_PATH = DATA_DIR / "test.csv"
 LAWS_PATH = DATA_DIR / "laws_de.csv"
 COURT_PATH = DATA_DIR / "court_considerations.csv"
 
-SPARSE_INDEX_PATH = MODELS_DIR / "corpus_sparse.npz"
-CORPUS_CITATIONS_PATH = MODELS_DIR / "corpus_citations.npy"
+BM25_INDEX_PATH = MODELS_DIR / "bm25_index.pkl"
 
 SUBMISSION_PATH = OUTPUTS_DIR / "submission.csv"
 
 # ── Model ──────────────────────────────────────────────────────────────────
-# MILCO: multilingual learned sparse retrieval
-#   milco-300m → lighter, faster encoding
-#   milco-650m → better quality (recommended)
+# MILCO only used at query time to rerank BM25 candidates — no full corpus encoding
 BASE_MODEL = "omai-research/milco-650m"
 
 # ── Corpus filtering ───────────────────────────────────────────────────────
-# Court decisions older than this year are unlikely to appear in gold citations
-# BGE vol 130 ≈ year 2004
-CORPUS_MIN_YEAR = 2004
+CORPUS_MIN_YEAR = 2004   # drop court decisions older than this
 
 # ── Retrieval ──────────────────────────────────────────────────────────────
-RETRIEVAL_TOP_K = 100         # candidates from sparse search
-FINAL_TOP_K = 20              # after adaptive cutoff
+BM25_TOP_K = 500          # candidates from BM25 first pass
+RERANK_TOP_K = 20         # final citations after MILCO rerank
 
 # Adaptive threshold: cut where score drops > this fraction of top score
 ADAPTIVE_GAP_FRACTION = 0.15
 
 # ── Encoding ───────────────────────────────────────────────────────────────
-ENCODE_BATCH_SIZE = 16   # MILCO 650m MLM head is memory-heavy; 16 safe on 22GB GPU
+ENCODE_BATCH_SIZE = 64    # for encoding BM25 candidates (small batches, safe)

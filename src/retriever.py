@@ -1,75 +1,106 @@
 """
-Retrieval pipeline: MILCO sparse encoding → sparse dot product → adaptive cutoff.
+Hybrid retrieval: BM25 first pass → MILCO rerank → adaptive cutoff.
 
 Modes:
-  build_index  — encode corpus and save sparse index (run once)
-  tune_k       — try threshold settings on val.csv
+  build_index  — build BM25 index from corpus (run once, CPU only)
+  tune_k       — find best threshold settings on val.csv
   baseline     — tune then generate submission
-  submit       — generate submission with given --k
+  submit       — generate submission
 """
 import argparse
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
 from pathlib import Path
 import config
+from bm25_index import BM25Index
 from embedder import Embedder
-from indexer import SparseIndexer
 from data_utils import load_val, load_test, parse_citations
 from evaluate import macro_f1
 
 
 class Retriever:
     def __init__(self, model_path: str = config.BASE_MODEL):
+        self.bm25 = BM25Index()
         self.embedder = Embedder(model_path)
-        self.indexer = SparseIndexer()
 
     def build_index(self):
-        """Encode corpus and build sparse index. Run once offline."""
+        """Build BM25 index from corpus. CPU only, run once."""
         from data_utils import load_corpus
         corpus = load_corpus()
-        self.indexer.build(corpus, self.embedder)
-        self.indexer.save()
+        self.bm25.build(corpus)
+        self.bm25.save()
 
     def load_index(self):
-        self.indexer.load()
+        self.bm25.load()
 
     def retrieve(
         self,
         queries: list[str],
-        top_k: int = config.RETRIEVAL_TOP_K,
+        bm25_top_k: int = config.BM25_TOP_K,
+        rerank_top_k: int = config.RERANK_TOP_K,
         adaptive: bool = True,
         gap_fraction: float = config.ADAPTIVE_GAP_FRACTION,
     ) -> list[list[str]]:
-        query_sparse = self.embedder.encode_queries(queries)
-        all_citations, all_scores = self.indexer.search(query_sparse, top_k=top_k)
+        """
+        For each query:
+          1. BM25 → top bm25_top_k candidates
+          2. MILCO rerank candidates
+          3. Adaptive cutoff → final citations
+        """
+        results = []
+        for query in queries:
+            candidates = self.bm25.search(query, top_k=bm25_top_k)
+            if not candidates:
+                results.append([])
+                continue
 
-        if not adaptive:
-            return [cits[:config.FINAL_TOP_K] for cits in all_citations]
+            texts = [c["text"] for c in candidates]
+            citations = [c["citation"] for c in candidates]
 
-        return [
-            _adaptive_cutoff(cits, scrs, gap_fraction)
-            for cits, scrs in zip(all_citations, all_scores)
-        ]
+            # MILCO rerank
+            q_sparse = self.embedder.encode_queries([query])
+            d_sparse = self.embedder.encode_documents(texts)
+            scores = (q_sparse @ d_sparse.T).toarray()[0].astype(float)
 
-    def tune_on_val(self, gap_values: list[float] = [0.05, 0.10, 0.15, 0.20, 0.25]):
-        """Try adaptive gap fractions + fixed top-k on val.csv."""
+            order = np.argsort(scores)[::-1]
+            ranked_citations = [citations[i] for i in order]
+            ranked_scores = scores[order]
+
+            if adaptive:
+                predicted = _adaptive_cutoff(ranked_citations, ranked_scores, gap_fraction)
+            else:
+                predicted = ranked_citations[:rerank_top_k]
+
+            results.append(predicted)
+
+        return results
+
+    def tune_on_val(self):
+        """Try gap fractions + fixed-k on val.csv and report Macro F1."""
         val = load_val()
         queries = val["query"].tolist()
         gold_list = [parse_citations(g) for g in val["gold_citations"]]
 
-        # Encode once, reuse
-        query_sparse = self.embedder.encode_queries(queries)
-        all_citations, all_scores = self.indexer.search(
-            query_sparse, top_k=config.RETRIEVAL_TOP_K
-        )
+        # BM25 + MILCO once, then try different cutoffs
+        all_citations, all_scores = [], []
+        for query in queries:
+            candidates = self.bm25.search(query, top_k=config.BM25_TOP_K)
+            texts = [c["text"] for c in candidates]
+            citations = [c["citation"] for c in candidates]
+
+            q_sparse = self.embedder.encode_queries([query])
+            d_sparse = self.embedder.encode_documents(texts)
+            scores = (q_sparse @ d_sparse.T).toarray()[0].astype(float)
+
+            order = np.argsort(scores)[::-1]
+            all_citations.append([citations[i] for i in order])
+            all_scores.append(scores[order])
 
         print(f"\n{'setting':>12} | {'Macro F1':>10}")
         print("-" * 28)
 
         best_setting, best_f1 = None, 0.0
 
-        # Fixed top-k
         for k in [5, 10, 15, 20]:
             preds = [cits[:k] for cits in all_citations]
             f1 = macro_f1(gold_list, preds)
@@ -77,8 +108,7 @@ class Retriever:
             if f1 > best_f1:
                 best_f1, best_setting = f1, ("fixed", k)
 
-        # Adaptive gap
-        for gap in gap_values:
+        for gap in [0.05, 0.10, 0.15, 0.20, 0.25]:
             preds = [
                 _adaptive_cutoff(cits, scrs, gap)
                 for cits, scrs in zip(all_citations, all_scores)
@@ -93,15 +123,17 @@ class Retriever:
 
     def generate_submission(
         self,
-        top_k: int = config.RETRIEVAL_TOP_K,
         adaptive: bool = True,
         gap_fraction: float = config.ADAPTIVE_GAP_FRACTION,
+        rerank_top_k: int = config.RERANK_TOP_K,
         output_path: Path = config.SUBMISSION_PATH,
     ):
         test = load_test()
         queries = test["query"].tolist()
         print(f"[submit] retrieving for {len(queries)} queries ...")
-        preds = self.retrieve(queries, top_k=top_k, adaptive=adaptive, gap_fraction=gap_fraction)
+        preds = self.retrieve(
+            queries, adaptive=adaptive, gap_fraction=gap_fraction, rerank_top_k=rerank_top_k
+        )
 
         config.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
         rows = [
@@ -119,19 +151,15 @@ def _adaptive_cutoff(
     scores: np.ndarray,
     gap_fraction: float,
 ) -> list[str]:
-    """Return citations up to the largest score gap > gap_fraction * top_score."""
     if len(citations) <= 1:
         return citations
-
     top_score = float(scores[0])
     threshold = gap_fraction * top_score
     best_cut, best_gap = len(citations), 0.0
-
     for i in range(len(citations) - 1):
         gap = float(scores[i]) - float(scores[i + 1])
         if gap > threshold and gap > best_gap:
             best_gap, best_cut = gap, i + 1
-
     return citations[:best_cut]
 
 
@@ -143,7 +171,6 @@ if __name__ == "__main__":
         default="baseline",
     )
     parser.add_argument("--model", default=config.BASE_MODEL)
-    parser.add_argument("--k", type=int, default=config.RETRIEVAL_TOP_K)
     parser.add_argument("--gap", type=float, default=config.ADAPTIVE_GAP_FRACTION)
     args = parser.parse_args()
 
@@ -161,10 +188,10 @@ if __name__ == "__main__":
         best = retriever.tune_on_val()
         kind, val = best
         if kind == "fixed":
-            retriever.generate_submission(top_k=val, adaptive=False)
+            retriever.generate_submission(adaptive=False, rerank_top_k=val)
         else:
             retriever.generate_submission(adaptive=True, gap_fraction=val)
 
     elif args.mode == "submit":
         retriever.load_index()
-        retriever.generate_submission(top_k=args.k, gap_fraction=args.gap)
+        retriever.generate_submission(gap_fraction=args.gap)

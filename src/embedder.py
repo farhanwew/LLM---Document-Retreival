@@ -1,19 +1,16 @@
 import numpy as np
 import torch
 import scipy.sparse as sp
-from tqdm import tqdm
 from transformers import AutoModel
 import config
 
 
 class Embedder:
     """
-    MILCO-based sparse embedder for cross-lingual retrieval.
+    MILCO embedder — used only at query time to rerank BM25 candidates.
 
-    encode_queries()  → sparse CSR matrix (n_queries, vocab_size)
-    encode_corpus()   → sparse CSR matrix (n_docs, vocab_size)
-
-    Scoring: query_sparse @ doc_sparse.T  (sparse dot product)
+    No full corpus pre-encoding needed. encode_documents() handles
+    small batches of BM25 candidates (~500 docs per query).
     """
 
     def __init__(self, model_name_or_path: str = config.BASE_MODEL):
@@ -29,34 +26,30 @@ class Embedder:
         print("[embedder] ready")
 
     def encode_queries(self, queries: list[str]) -> sp.csr_matrix:
-        """Encode queries → sparse CSR matrix (n_queries, vocab_size)."""
+        """Encode queries → sparse CSR (n_queries, vocab_size)."""
         with torch.no_grad():
             sparse_out = self.model.encode_query(queries)
         return self._to_scipy(sparse_out)
 
-    def encode_corpus(
-        self,
-        texts: list[str],
-        batch_size: int = config.ENCODE_BATCH_SIZE,
-    ) -> sp.csr_matrix:
-        """Encode corpus documents → sparse CSR matrix (n_docs, vocab_size).
+    def encode_documents(self, texts: list[str]) -> sp.csr_matrix:
+        """Encode a small batch of documents → sparse CSR (n_docs, vocab_size).
 
-        Processes in batches and builds the full sparse matrix in one shot
-        to avoid slow repeated vstack calls.
+        Used for reranking BM25 candidates (~500 docs), not full corpus.
         """
         all_rows, all_cols, all_vals = [], [], []
         vocab_size = None
         row_offset = 0
+        batch_size = config.ENCODE_BATCH_SIZE
 
-        for i in tqdm(range(0, len(texts), batch_size), desc="encoding corpus"):
+        for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             with torch.no_grad():
                 sparse_out = self.model.encode_document(batch)
+            torch.cuda.empty_cache()
 
             sparse_out = sparse_out.coalesce().cpu()
-            torch.cuda.empty_cache()
-            indices = sparse_out.indices().numpy()  # (2, nnz)
-            values = sparse_out.values().numpy()    # (nnz,)
+            indices = sparse_out.indices().numpy()
+            values = sparse_out.values().numpy()
 
             all_rows.append(indices[0] + row_offset)
             all_cols.append(indices[1])
@@ -76,7 +69,6 @@ class Embedder:
         )
 
     def _to_scipy(self, sparse_tensor: torch.Tensor) -> sp.csr_matrix:
-        """Convert a 2D torch sparse tensor → scipy CSR matrix."""
         sparse_tensor = sparse_tensor.coalesce().cpu()
         indices = sparse_tensor.indices().numpy()
         values = sparse_tensor.values().numpy()
@@ -86,11 +78,3 @@ class Embedder:
             shape=shape,
             dtype=np.float32,
         )
-
-    def save(self, path: str):
-        self.model.save_pretrained(str(path))
-        print(f"[embedder] model saved → {path}")
-
-    @classmethod
-    def load(cls, path: str) -> "Embedder":
-        return cls(model_name_or_path=str(path))
