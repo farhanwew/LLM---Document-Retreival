@@ -45,9 +45,8 @@ class BM25Index:
 
     def load(self, path: Path = config.BM25_INDEX_PATH):
         print(f"[bm25] loading from {path} ...")
-        self.retriever, self.texts = bm25s.BM25.load(
-            str(path) + ".bm25s", load_corpus=True
-        )
+        self.retriever = bm25s.BM25.load(str(path) + ".bm25s", load_corpus=True)
+        self.texts = self.retriever.corpus
         with open(str(path) + ".meta.pkl", "rb") as f:
             data = pickle.load(f)
         self.citations = data["citations"]
