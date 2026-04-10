@@ -54,6 +54,6 @@ WARMUP_STEPS = 100
 FP16 = True
 
 # ── Encoding ───────────────────────────────────────────────────────────────
-ENCODE_BATCH_SIZE = 64        # reduced from 128 — court docs can be long
+ENCODE_BATCH_SIZE = 256       # safe now that MAX_SEQ_LENGTH is capped
 MAX_SEQ_LENGTH = 512          # truncate to this many tokens (Qwen3 default is 32k → OOM)
 NORMALIZE_EMBEDDINGS = True   # required for cosine similarity with FAISS IP
