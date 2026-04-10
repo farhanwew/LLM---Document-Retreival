@@ -52,7 +52,8 @@ class BM25Index:
         print(f"[bm25] saved → {path}")
 
     def load(self, path: Path = config.BM25_INDEX_PATH):
-        print(f"[bm25] loading from {path} ...")
+        size_mb = path.stat().st_size / 1e6
+        print(f"[bm25] loading {size_mb:.0f} MB from {path} ...")
         with open(path, "rb") as f:
             data = pickle.load(f)
         self.bm25 = data["bm25"]

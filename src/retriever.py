@@ -11,6 +11,7 @@ import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from tqdm import tqdm
 import config
 from bm25_index import BM25Index
 from embedder import Embedder
@@ -48,7 +49,7 @@ class Retriever:
           3. Adaptive cutoff → final citations
         """
         results = []
-        for query in queries:
+        for query in tqdm(queries, desc="retrieving"):
             candidates = self.bm25.search(query, top_k=bm25_top_k)
             if not candidates:
                 results.append([])
@@ -83,7 +84,7 @@ class Retriever:
 
         # BM25 + MILCO once, then try different cutoffs
         all_citations, all_scores = [], []
-        for query in queries:
+        for query in tqdm(queries, desc="tuning"):
             candidates = self.bm25.search(query, top_k=config.BM25_TOP_K)
             texts = [c["text"] for c in candidates]
             citations = [c["citation"] for c in candidates]
