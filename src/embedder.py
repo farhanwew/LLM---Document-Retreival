@@ -16,7 +16,8 @@ class Embedder:
     def __init__(self, model_name_or_path: str = config.BASE_MODEL):
         print(f"[embedder] loading model: {model_name_or_path}")
         self.model = SentenceTransformer(model_name_or_path)
-        print("[embedder] model loaded")
+        self.model.max_seq_length = config.MAX_SEQ_LENGTH
+        print(f"[embedder] model loaded (max_seq_length={config.MAX_SEQ_LENGTH})")
 
     def encode(
         self,
