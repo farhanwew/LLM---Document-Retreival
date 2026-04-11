@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from transformers import AutoModel
+from tqdm import tqdm
 import config
 
 
@@ -65,7 +66,7 @@ class Embedder:
         row_offset = 0
         batch_size = config.ENCODE_BATCH_SIZE
 
-        for i in range(0, len(texts), batch_size):
+        for i in tqdm(range(0, len(texts), batch_size), desc="encoding documents", unit="batch"):
             batch = texts[i : i + batch_size]
             with torch.no_grad():
                 sparse_out = self.model.encode_document(batch)
@@ -73,6 +74,10 @@ class Embedder:
             # FIX: Move to CPU BEFORE coalesce to reduce GPU memory usage
             sparse_out = sparse_out.cpu()
             torch.cuda.empty_cache()
+            
+            # FIX: Correctly get vocab_size from the sparse tensor shape
+            if vocab_size is None:
+                vocab_size = sparse_out.shape[1]
             
             sparse_out = sparse_out.coalesce()
             indices = sparse_out.indices().numpy()
@@ -86,7 +91,6 @@ class Embedder:
             all_cols.append(indices[1])
             all_vals.append(values)
 
-            vocab_size = indices.shape[1] if len(indices) > 1 else 1
             row_offset += len(batch)
 
         rows = np.concatenate(all_rows)
