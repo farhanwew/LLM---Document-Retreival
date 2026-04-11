@@ -31,4 +31,4 @@ RERANK_TOP_K = 20         # final citations after MILCO rerank
 ADAPTIVE_GAP_FRACTION = 0.15
 
 # ── Encoding ───────────────────────────────────────────────────────────────
-ENCODE_BATCH_SIZE = 64    # for encoding BM25 candidates (small batches, safe)
+ENCODE_BATCH_SIZE = 16    # reduced from 64 to avoid OOM
