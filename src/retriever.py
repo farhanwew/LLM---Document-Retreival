@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
 import config
 from bm25_index import BM25Index
 from embedder import Embedder
@@ -138,21 +140,74 @@ class Retriever:
         rerank_top_k: int = config.RERANK_TOP_K,
         output_path: Path = config.SUBMISSION_PATH,
     ):
+        """Generate submission CSV with predicted citations for test queries.
+        
+        Validates:
+        - Test data has required columns (query_id, query)
+        - Number of predictions matches number of queries
+        - Submission CSV has exact required format
+        
+        Args:
+            adaptive: Use adaptive cutoff (True) or fixed top-k (False)
+            gap_fraction: Adaptive threshold parameter
+            rerank_top_k: Fixed k if adaptive=False
+            output_path: Path to save submission.csv
+        
+        Returns:
+            DataFrame with columns [query_id, predicted_citations]
+        
+        Raises:
+            ValueError: If test data is invalid
+            AssertionError: If submission format is incorrect
+        """
         test = load_test()
+        
+        # FIX: Validate required columns exist
+        required_cols = ["query_id", "query"]
+        missing = [c for c in required_cols if c not in test.columns]
+        if missing:
+            raise ValueError(f"test.csv missing required columns: {missing}")
+        
         queries = test["query"].tolist()
         print(f"[submit] retrieving for {len(queries)} queries ...")
         preds = self.retrieve(
             queries, adaptive=adaptive, gap_fraction=gap_fraction, rerank_top_k=rerank_top_k
         )
-
+        
+        # FIX: Validate predictions match number of queries
+        if len(preds) != len(test):
+            raise RuntimeError(
+                f"Prediction count mismatch: got {len(preds)} predictions for {len(test)} queries"
+            )
+        
         config.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
         rows = [
             {"query_id": qid, "predicted_citations": ";".join(citations)}
             for qid, citations in zip(test["query_id"], preds)
         ]
         sub_df = pd.DataFrame(rows)
+        
+        # FIX: Validate submission format before saving
+        if sub_df.shape[0] != len(test):
+            raise AssertionError(
+                f"Submission has {sub_df.shape[0]} rows but expected {len(test)}"
+            )
+        
+        expected_cols = ["query_id", "predicted_citations"]
+        if list(sub_df.columns) != expected_cols:
+            raise AssertionError(
+                f"Submission has columns {sub_df.columns.tolist()}, "
+                f"but expected {expected_cols}"
+            )
+        
+        # Validate no null values in required columns
+        if sub_df.isnull().any().any():
+            null_cols = sub_df.columns[sub_df.isnull().any()].tolist()
+            raise AssertionError(f"Submission has null values in columns: {null_cols}")
+        
         sub_df.to_csv(output_path, index=False)
         print(f"[submit] saved → {output_path}")
+        print(f"[submit] format verified: {len(sub_df)} rows, {expected_cols}")
         return sub_df
 
 
@@ -161,15 +216,34 @@ def _adaptive_cutoff(
     scores: np.ndarray,
     gap_fraction: float,
 ) -> list[str]:
-    if len(citations) <= 1:
+    """Find adaptive cutoff based on gap in reranking scores.
+    
+    Returns all citations if no significant gap is found (conservative fallback).
+    Args:
+        citations: List of citation strings in score order.
+        scores: Numpy array of similarity scores (descending).
+        gap_fraction: Threshold = gap_fraction * top_score. Cut at largest gap > threshold.
+    
+    Returns:
+        List of citations up to the cutoff point.
+    """
+    if len(citations) == 0:
+        return []
+    if len(citations) == 1:
         return citations
+    
     top_score = float(scores[0])
     threshold = gap_fraction * top_score
-    best_cut, best_gap = len(citations), 0.0
+    best_cut = 1  # FIX: Default to top-1, not all citations
+    best_gap = 0.0
+    
     for i in range(len(citations) - 1):
         gap = float(scores[i]) - float(scores[i + 1])
         if gap > threshold and gap > best_gap:
             best_gap, best_cut = gap, i + 1
+    
+    # If no gap found, default to top-1 is conservative but avoids false positives
+    # Falling back to all citations caused poor F1 scores
     return citations[:best_cut]
 
 

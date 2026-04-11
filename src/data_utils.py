@@ -1,5 +1,8 @@
 import re
 import pandas as pd
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
 import config
 
 
@@ -47,23 +50,54 @@ def load_corpus(min_year: int = config.CORPUS_MIN_YEAR) -> pd.DataFrame:
 
     Court decisions older than min_year are dropped — they are not expected
     in gold citations per competition data description.
+    
+    Raises:
+        FileNotFoundError: If required CSV files are missing.
+        RuntimeError: If CSV files cannot be read.
     """
-    print("[data] loading laws_de.csv ...")
-    laws = pd.read_csv(config.LAWS_PATH)
+    # Load laws_de.csv
+    try:
+        print("[data] loading laws_de.csv ...")
+        laws = pd.read_csv(config.LAWS_PATH)
+        print(f"[data] laws_de: {len(laws):,} rows loaded")
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"laws_de.csv not found at {config.LAWS_PATH}\n"
+            f"Download from Kaggle competition page to data/ directory"
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error reading laws_de.csv: {e}")
 
-    print("[data] loading court_considerations.csv (big!) ...")
-    court = pd.read_csv(config.COURT_PATH)
+    # Load court_considerations.csv (optional but recommended)
+    try:
+        print("[data] loading court_considerations.csv (big!) ...")
+        court = pd.read_csv(config.COURT_PATH)
+        print(f"[data] court_considerations: {len(court):,} rows loaded")
+    except FileNotFoundError:
+        print("[data] WARNING: court_considerations.csv not found (optional)")
+        print(f"[data] To get better results, download from {config.COURT_PATH}")
+        court = pd.DataFrame(columns=["citation", "text"])
+    except Exception as e:
+        raise RuntimeError(f"Error reading court_considerations.csv: {e}")
 
     # Filter old court decisions
-    court["_year"] = court["citation"].apply(parse_citation_year)
-    before = len(court)
-    court = court[court["_year"].isna() | (court["_year"] >= min_year)]
-    court = court.drop(columns=["_year"])
-    print(f"[data] court: kept {len(court):,} / {before:,} rows (year >= {min_year})")
+    if len(court) > 0:
+        court["_year"] = court["citation"].apply(parse_citation_year)
+        before = len(court)
+        court = court[court["_year"].isna() | (court["_year"] >= min_year)]
+        court = court.drop(columns=["_year"])
+        print(f"[data] court: kept {len(court):,} / {before:,} rows (year >= {min_year})")
 
     corpus = pd.concat([laws, court], ignore_index=True)
     corpus = corpus.dropna(subset=["citation", "text"])
-    corpus = corpus.drop_duplicates(subset=["citation"])
+    
+    # Check for duplicates
+    duplicates = corpus[corpus.duplicated(subset=["citation"], keep=False)]
+    if len(duplicates) > 0:
+        print(f"[data] WARNING: {len(duplicates)} rows with duplicate citations")
+        print(f"[data] Keeping last occurrence of each citation")
+    
+    corpus = corpus.drop_duplicates(subset=["citation"], keep="last")
     corpus = corpus.reset_index(drop=True)
 
     print(f"[data] corpus total: {len(corpus):,} rows")

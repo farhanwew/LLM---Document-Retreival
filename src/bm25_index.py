@@ -8,11 +8,12 @@ Usage:
     python src/bm25_index.py
 """
 import bm25s
-import numpy as np
 import pandas as pd
 import pickle
 from pathlib import Path
 from tqdm import tqdm
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
 import config
 from data_utils import load_corpus
 
@@ -37,19 +38,34 @@ class BM25Index:
 
     def save(self, path: Path = config.BM25_INDEX_PATH):
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Save bm25s retriever + citations/texts separately
-        self.retriever.save(str(path) + ".bm25s", corpus=self.texts)
+        # Save bm25s index (no corpus) + citations/texts in separate pickle
+        self.retriever.save(str(path) + ".bm25s")
         with open(str(path) + ".meta.pkl", "wb") as f:
-            pickle.dump({"citations": self.citations}, f)
+            pickle.dump({"citations": self.citations, "texts": self.texts}, f)
         print(f"[bm25] saved → {path}")
 
     def load(self, path: Path = config.BM25_INDEX_PATH):
+        meta_path = Path(str(path) + ".meta.pkl")
+        bm25s_path = Path(str(path) + ".bm25s")
+
+        if not bm25s_path.exists() or not meta_path.exists():
+            raise FileNotFoundError(
+                f"Index not found at {path}. Run: python src/bm25_index.py"
+            )
+
         print(f"[bm25] loading from {path} ...")
-        self.retriever = bm25s.BM25.load(str(path) + ".bm25s", load_corpus=True)
-        self.texts = self.retriever.corpus
-        with open(str(path) + ".meta.pkl", "rb") as f:
+        # load_corpus=False → retrieve() returns integer indices
+        self.retriever = bm25s.BM25.load(str(bm25s_path), load_corpus=False)
+        with open(meta_path, "rb") as f:
             data = pickle.load(f)
+
+        if "texts" not in data:
+            raise KeyError(
+                "Index is outdated (missing 'texts'). Rebuild: python src/bm25_index.py"
+            )
+
         self.citations = data["citations"]
+        self.texts = data["texts"]
         print(f"[bm25] loaded {len(self.citations):,} docs")
 
     def search(self, query: str, top_k: int = config.BM25_TOP_K) -> list[dict]:
