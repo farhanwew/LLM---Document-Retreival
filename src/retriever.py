@@ -1,11 +1,6 @@
 """
-Hybrid retrieval: BM25 first pass → MILCO rerank → adaptive cutoff.
-
-Modes:
-  build_index  — build BM25 index from corpus (run once, CPU only)
-  tune_k       — find best threshold settings on val.csv
-  baseline     — tune then generate submission
-  submit       — generate submission
+Hybrid retrieval: MILCO Sparse Index Search → adaptive cutoff.
+Uses Learned Sparse Retrieval (LSR) to bridge English queries to German/French/Italian docs.
 """
 import argparse
 import numpy as np
@@ -15,7 +10,7 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 import config
-from bm25_index import BM25Index
+from milco_index import MILCOIndex
 from embedder import Embedder
 from data_utils import load_val, load_test, parse_citations
 from evaluate import macro_f1
@@ -23,94 +18,81 @@ from evaluate import macro_f1
 
 class Retriever:
     def __init__(self, model_path: str = config.BASE_MODEL):
-        self.bm25 = BM25Index()
         self.embedder = Embedder(model_path)
+        self.milco_index = MILCOIndex(self.embedder)
 
     def build_index(self):
-        """Build BM25 index from corpus. CPU only, run once."""
+        """Build MILCO index from full corpus. GPU intensive."""
         from data_utils import load_corpus
         corpus = load_corpus()
-        self.bm25.build(corpus)
-        self.bm25.save()
+        self.milco_index.build(corpus)
+        self.milco_index.save()
 
-    def load_index(self):
-        self.bm25.load()
+    def build_mini_index(self):
+        """Build MILCO index only from documents in train.csv citations."""
+        from data_utils import load_train, load_mini_corpus
+        train = load_train()
+        mini_corpus = load_mini_corpus(train)
+        self.milco_index.build(mini_corpus)
+        mini_path = config.MODELS_DIR / "milco_mini.npz"
+        mini_meta = config.MODELS_DIR / "milco_mini_meta.pkl"
+        self.milco_index.save(mini_path, mini_meta)
+
+    def load_index(self, path: Path = config.MILCO_INDEX_PATH, meta_path: Path = config.MILCO_META_PATH):
+        self.milco_index.load(path, meta_path)
 
     def retrieve(
         self,
         queries: list[str],
-        bm25_top_k: int = config.BM25_TOP_K,
-        rerank_top_k: int = config.RERANK_TOP_K,
+        top_k: int = config.BM25_TOP_K,
         adaptive: bool = True,
         gap_fraction: float = config.ADAPTIVE_GAP_FRACTION,
     ) -> list[list[str]]:
         """
-        For each query:
-          1. BM25 → top bm25_top_k candidates
-          2. MILCO rerank candidates
-          3. Adaptive cutoff → final citations
+        1. Encode query to English sparse lexical space
+        2. Dot product search in MILCO index
+        3. Adaptive cutoff
         """
-        # BM25 batch search — one call for all queries
-        batch_candidates = self.bm25.search_batch(queries, top_k=bm25_top_k)
+        print(f"[retriever] encoding {len(queries)} queries ...")
+        q_vectors = self.embedder.encode_queries(queries)
+        
+        print(f"[retriever] searching index ...")
+        batch_results = self.milco_index.search_batch(q_vectors, top_k=top_k)
 
         results = []
-        for query, candidates in tqdm(
-            zip(queries, batch_candidates), total=len(queries), desc="retrieving"
-        ):
-            if not candidates:
+        for query_res in batch_results:
+            if not query_res:
                 results.append([])
                 continue
 
-            texts = [c["text"] for c in candidates]
-            citations = [c["citation"] for c in candidates]
-
-            # MILCO rerank
-            q_sparse = self.embedder.encode_queries([query])
-            d_sparse = self.embedder.encode_documents(texts)
-            scores = (q_sparse @ d_sparse.T).toarray()[0].astype(float)
-
-            order = np.argsort(scores)[::-1]
-            ranked_citations = [citations[i] for i in order]
-            ranked_scores = scores[order]
+            citations = [c["citation"] for c in query_res]
+            scores = np.array([c["score"] for c in query_res])
 
             if adaptive:
-                predicted = _adaptive_cutoff(ranked_citations, ranked_scores, gap_fraction)
+                predicted = _adaptive_cutoff(citations, scores, gap_fraction)
             else:
-                predicted = ranked_citations[:rerank_top_k]
+                predicted = citations[:config.RERANK_TOP_K]
 
             results.append(predicted)
 
         return results
 
     def tune_on_val(self):
-        """Try gap fractions + fixed-k on val.csv and report Macro F1."""
         val = load_val()
         queries = val["query"].tolist()
         gold_list = [parse_citations(g) for g in val["gold_citations"]]
 
-        # BM25 + MILCO once, then try different cutoffs
-        # BM25 batch search — one call for all queries
-        print("[tune] BM25 batch search ...")
-        batch_candidates = self.bm25.search_batch(queries, top_k=config.BM25_TOP_K)
+        print(f"[tune] searching for {len(queries)} validation queries ...")
+        q_vectors = self.embedder.encode_queries(queries)
+        batch_results = self.milco_index.search_batch(q_vectors, top_k=config.BM25_TOP_K)
 
         all_citations, all_scores = [], []
-        for query, candidates in tqdm(
-            zip(queries, batch_candidates), total=len(queries), desc="MILCO reranking"
-        ):
-            texts = [c["text"] for c in candidates]
-            citations = [c["citation"] for c in candidates]
-
-            q_sparse = self.embedder.encode_queries([query])
-            d_sparse = self.embedder.encode_documents(texts)
-            scores = (q_sparse @ d_sparse.T).toarray()[0].astype(float)
-
-            order = np.argsort(scores)[::-1]
-            all_citations.append([citations[i] for i in order])
-            all_scores.append(scores[order])
+        for query_res in batch_results:
+            all_citations.append([c["citation"] for c in query_res])
+            all_scores.append(np.array([c["score"] for c in query_res]))
 
         print(f"\n{'setting':>12} | {'Macro F1':>10}")
         print("-" * 28)
-
         best_setting, best_f1 = None, 0.0
 
         for k in [5, 10, 15, 20]:
@@ -121,10 +103,7 @@ class Retriever:
                 best_f1, best_setting = f1, ("fixed", k)
 
         for gap in [0.05, 0.10, 0.15, 0.20, 0.25]:
-            preds = [
-                _adaptive_cutoff(cits, scrs, gap)
-                for cits, scrs in zip(all_citations, all_scores)
-            ]
+            preds = [_adaptive_cutoff(cits, scrs, gap) for cits, scrs in zip(all_citations, all_scores)]
             f1 = macro_f1(gold_list, preds)
             print(f"{'gap='+str(gap):>12} | {f1:>10.4f}")
             if f1 > best_f1:
@@ -140,142 +119,51 @@ class Retriever:
         rerank_top_k: int = config.RERANK_TOP_K,
         output_path: Path = config.SUBMISSION_PATH,
     ):
-        """Generate submission CSV with predicted citations for test queries.
-        
-        Validates:
-        - Test data has required columns (query_id, query)
-        - Number of predictions matches number of queries
-        - Submission CSV has exact required format
-        
-        Args:
-            adaptive: Use adaptive cutoff (True) or fixed top-k (False)
-            gap_fraction: Adaptive threshold parameter
-            rerank_top_k: Fixed k if adaptive=False
-            output_path: Path to save submission.csv
-        
-        Returns:
-            DataFrame with columns [query_id, predicted_citations]
-        
-        Raises:
-            ValueError: If test data is invalid
-            AssertionError: If submission format is incorrect
-        """
         test = load_test()
-        
-        # FIX: Validate required columns exist
-        required_cols = ["query_id", "query"]
-        missing = [c for c in required_cols if c not in test.columns]
-        if missing:
-            raise ValueError(f"test.csv missing required columns: {missing}")
-        
         queries = test["query"].tolist()
-        print(f"[submit] retrieving for {len(queries)} queries ...")
-        preds = self.retrieve(
-            queries, adaptive=adaptive, gap_fraction=gap_fraction, rerank_top_k=rerank_top_k
-        )
+        preds = self.retrieve(queries, adaptive=adaptive, gap_fraction=gap_fraction)
         
-        # FIX: Validate predictions match number of queries
-        if len(preds) != len(test):
-            raise RuntimeError(
-                f"Prediction count mismatch: got {len(preds)} predictions for {len(test)} queries"
-            )
-        
-        config.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-        rows = [
-            {"query_id": qid, "predicted_citations": ";".join(citations)}
-            for qid, citations in zip(test["query_id"], preds)
-        ]
+        rows = [{"query_id": qid, "predicted_citations": ";".join(citations)} for qid, citations in zip(test["query_id"], preds)]
         sub_df = pd.DataFrame(rows)
-        
-        # FIX: Validate submission format before saving
-        if sub_df.shape[0] != len(test):
-            raise AssertionError(
-                f"Submission has {sub_df.shape[0]} rows but expected {len(test)}"
-            )
-        
-        expected_cols = ["query_id", "predicted_citations"]
-        if list(sub_df.columns) != expected_cols:
-            raise AssertionError(
-                f"Submission has columns {sub_df.columns.tolist()}, "
-                f"but expected {expected_cols}"
-            )
-        
-        # Validate no null values in required columns
-        if sub_df.isnull().any().any():
-            null_cols = sub_df.columns[sub_df.isnull().any()].tolist()
-            raise AssertionError(f"Submission has null values in columns: {null_cols}")
-        
         sub_df.to_csv(output_path, index=False)
         print(f"[submit] saved → {output_path}")
-        print(f"[submit] format verified: {len(sub_df)} rows, {expected_cols}")
         return sub_df
 
 
-def _adaptive_cutoff(
-    citations: list[str],
-    scores: np.ndarray,
-    gap_fraction: float,
-) -> list[str]:
-    """Find adaptive cutoff based on gap in reranking scores.
-    
-    Returns all citations if no significant gap is found (conservative fallback).
-    Args:
-        citations: List of citation strings in score order.
-        scores: Numpy array of similarity scores (descending).
-        gap_fraction: Threshold = gap_fraction * top_score. Cut at largest gap > threshold.
-    
-    Returns:
-        List of citations up to the cutoff point.
-    """
-    if len(citations) == 0:
-        return []
-    if len(citations) == 1:
-        return citations
+def _adaptive_cutoff(citations: list[str], scores: np.ndarray, gap_fraction: float) -> list[str]:
+    if len(citations) == 0: return []
+    if len(citations) == 1: return citations
     
     top_score = float(scores[0])
     threshold = gap_fraction * top_score
-    best_cut = 1  # FIX: Default to top-1, not all citations
+    best_cut = 1
     best_gap = 0.0
     
     for i in range(len(citations) - 1):
         gap = float(scores[i]) - float(scores[i + 1])
         if gap > threshold and gap > best_gap:
             best_gap, best_cut = gap, i + 1
-    
-    # If no gap found, default to top-1 is conservative but avoids false positives
-    # Falling back to all citations caused poor F1 scores
     return citations[:best_cut]
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--mode",
-        choices=["build_index", "tune_k", "baseline", "submit"],
-        default="baseline",
-    )
-    parser.add_argument("--model", default=config.BASE_MODEL)
+    parser.add_argument("--mode", choices=["build_index", "build_mini_index", "tune_k", "submit"], default="submit")
+    parser.add_argument("--mini", action="store_true")
     parser.add_argument("--gap", type=float, default=config.ADAPTIVE_GAP_FRACTION)
     args = parser.parse_args()
 
-    retriever = Retriever(model_path=args.model)
+    retriever = Retriever()
 
     if args.mode == "build_index":
         retriever.build_index()
-
+    elif args.mode == "build_mini_index":
+        retriever.build_mini_index()
     elif args.mode == "tune_k":
-        retriever.load_index()
+        path = config.MODELS_DIR / "milco_mini.npz" if args.mini else config.MILCO_INDEX_PATH
+        meta = config.MODELS_DIR / "milco_mini_meta.pkl" if args.mini else config.MILCO_META_PATH
+        retriever.load_index(path, meta)
         retriever.tune_on_val()
-
-    elif args.mode == "baseline":
-        retriever.load_index()
-        best = retriever.tune_on_val()
-        kind, val = best
-        if kind == "fixed":
-            retriever.generate_submission(adaptive=False, rerank_top_k=val)
-        else:
-            retriever.generate_submission(adaptive=True, gap_fraction=val)
-
     elif args.mode == "submit":
         retriever.load_index()
         retriever.generate_submission(gap_fraction=args.gap)

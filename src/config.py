@@ -13,6 +13,8 @@ LAWS_PATH = DATA_DIR / "laws_de.csv"
 COURT_PATH = DATA_DIR / "court_considerations.csv"
 
 BM25_INDEX_PATH = MODELS_DIR / "bm25_index.pkl"
+MILCO_INDEX_PATH = MODELS_DIR / "milco_index.npz"
+MILCO_META_PATH = MODELS_DIR / "milco_meta.pkl"
 
 SUBMISSION_PATH = OUTPUTS_DIR / "submission.csv"
 

@@ -104,6 +104,29 @@ def load_corpus(min_year: int = config.CORPUS_MIN_YEAR) -> pd.DataFrame:
     return corpus
 
 
+def load_mini_corpus(train_df: pd.DataFrame, min_year: int = config.CORPUS_MIN_YEAR) -> pd.DataFrame:
+    """Load only documents that appear in the training set citations.
+    
+    Useful for faster tuning and debugging without indexing millions of docs.
+    """
+    # Get unique gold citations from train
+    all_gold = []
+    for g in train_df["gold_citations"]:
+        all_gold.extend(parse_citations(g))
+    gold_set = set(all_gold)
+    
+    print(f"[data] unique citations in train: {len(gold_set):,}")
+    
+    # Load full corpus (which already filters by year)
+    full_corpus = load_corpus(min_year=min_year)
+    
+    # Filter to only include those in gold_set
+    mini_corpus = full_corpus[full_corpus["citation"].isin(gold_set)].reset_index(drop=True)
+    
+    print(f"[data] mini corpus created: {len(mini_corpus):,} / {len(full_corpus):,} rows")
+    return mini_corpus
+
+
 def parse_citations(citation_str: str) -> list[str]:
     """Split semicolon-separated citation string into list."""
     if pd.isna(citation_str) or citation_str == "":
