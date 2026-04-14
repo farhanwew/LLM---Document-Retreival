@@ -43,15 +43,19 @@ from finetune.config import cfg
 # ---------------------------------------------------------------------------
 
 def load_corpus(laws_path: str, court_path: str) -> dict[str, str]:
-    """Build citation → text lookup from both corpus files."""
+    """Build citation → text lookup from corpus files. Pass empty string to skip a file."""
     parts = []
     for path in [laws_path, court_path]:
+        if not path:
+            continue
         if os.path.exists(path):
             df = pd.read_csv(path)
             parts.append(df[["citation", "text"]].dropna())
             print(f"  Loaded {len(df):,} rows from {path}")
         else:
             print(f"  WARNING: {path} not found, skipping")
+    if not parts:
+        return {}
     corpus_df = pd.concat(parts, ignore_index=True)
     return dict(zip(corpus_df["citation"], corpus_df["text"]))
 
@@ -136,6 +140,22 @@ def translate_queries(queries: list[str], cache_path: str,
 # Hard negative mining (NVIDIA NeMo concept, custom implementation)
 # ---------------------------------------------------------------------------
 
+def get_device() -> str:
+    """
+    Detect usable device. Falls back to CPU if GPU compute capability is too low.
+    Tesla P100 = sm_60, but recent PyTorch requires sm_70+.
+    """
+    if not torch.cuda.is_available():
+        return "cpu"
+    try:
+        # Quick smoke test — if the GPU can't run kernels, this will raise
+        _ = torch.zeros(1).cuda() + torch.zeros(1).cuda()
+        return "cuda"
+    except Exception as e:
+        print(f"  WARNING: GPU unusable ({e}), falling back to CPU")
+        return "cpu"
+
+
 def mine_hard_negatives(
     queries: list[str],
     positives: list[str],
@@ -147,15 +167,23 @@ def mine_hard_negatives(
     corpus_chunk_size: int,
     query_prefix: str,
     passage_prefix: str,
+    max_corpus_docs: int = 100_000,
 ) -> list[str]:
     """
     For each query, retrieve top-K corpus docs, filter true positives, return hard negatives.
 
     Args:
         hard_neg_margin: docs with similarity > top_score * margin are excluded (NVIDIA: 0.95)
+        max_corpus_docs: cap corpus size for mining to avoid OOM / excessive time on CPU
     """
-    print("  Loading model for hard negative mining...")
-    model = SentenceTransformer(model_name)
+    device = get_device()
+    print(f"  Device for mining: {device}")
+    print(f"  Loading model for hard negative mining...")
+
+    model = SentenceTransformer(model_name, device=device)
+
+    # Adjust batch size for CPU (much smaller to avoid slowness spiral)
+    encode_batch = mining_batch_size if device == "cuda" else 16
 
     # Build set of positive texts per query for filtering
     pos_set_per_query = {}
@@ -169,14 +197,30 @@ def mine_hard_negatives(
     print(f"  Encoding {len(unique_queries):,} unique queries...")
     query_embs = model.encode(
         prefixed_queries,
-        batch_size=mining_batch_size,
+        batch_size=encode_batch,
         show_progress_bar=True,
         normalize_embeddings=True,
     )
 
-    # Encode corpus in chunks (NVIDIA: corpus_chunk_size=50000)
+    # Cap corpus size for mining — 2M+ docs is impractical on CPU
+    # Prefer to keep docs that are actually gold citations (higher mining signal)
     corpus_citations = list(corpus.keys())
     corpus_texts = list(corpus.values())
+    if len(corpus_citations) > max_corpus_docs:
+        print(f"  Sampling corpus: {max_corpus_docs:,} / {len(corpus_citations):,} docs for mining")
+        # Keep gold positive docs + random sample of the rest
+        pos_cits = set()
+        for q, p in zip(queries, positives):
+            pos_cits.add(p)
+        priority_idx = [i for i, t in enumerate(corpus_texts) if t in pos_cits]
+        other_idx = [i for i in range(len(corpus_texts)) if i not in set(priority_idx)]
+        np.random.shuffle(other_idx)
+        keep_idx = priority_idx + other_idx[: max_corpus_docs - len(priority_idx)]
+        corpus_citations = [corpus_citations[i] for i in keep_idx]
+        corpus_texts = [corpus_texts[i] for i in keep_idx]
+        print(f"  Mining corpus: {len(corpus_citations):,} docs "
+              f"({len(priority_idx):,} gold positives + {len(keep_idx)-len(priority_idx):,} random)")
+
     prefixed_texts = [passage_prefix + t for t in corpus_texts]
 
     print(f"  Encoding corpus ({len(corpus_texts):,} docs) in chunks of {corpus_chunk_size:,}...")
@@ -185,7 +229,7 @@ def mine_hard_negatives(
         chunk = prefixed_texts[start: start + corpus_chunk_size]
         emb = model.encode(
             chunk,
-            batch_size=mining_batch_size,
+            batch_size=encode_batch,
             show_progress_bar=False,
             normalize_embeddings=True,
         )
@@ -197,8 +241,12 @@ def mine_hard_negatives(
     top_k = hard_neg_per_query * 10  # retrieve more, filter down
     query_to_hardnegs = {}
 
-    # Batch score all queries at once (may be large; use chunks if OOM)
-    scores = query_embs @ corpus_embs.T  # (n_queries, n_corpus)
+    # Score in row-chunks to avoid OOM on large query × corpus matrix
+    chunk_size_q = 256  # score 256 queries at a time
+    scores = np.empty((len(unique_queries), len(corpus_texts)), dtype=np.float32)
+    for start in range(0, len(unique_queries), chunk_size_q):
+        end = min(start + chunk_size_q, len(unique_queries))
+        scores[start:end] = query_embs[start:end] @ corpus_embs.T
 
     for i, q in enumerate(unique_queries):
         row_scores = scores[i]
@@ -250,6 +298,23 @@ def main():
     )
     parser.add_argument("--no-hard-negatives", action="store_true",
                         help="Skip hard negative mining (faster, lower quality)")
+    parser.add_argument(
+        "--max-corpus-for-mining", type=int, default=100_000,
+        help=(
+            "Max corpus docs to use for hard neg mining. "
+            "Full corpus (2M+) is impractical on CPU. "
+            "Default 100k: all gold positives + random sample. "
+            "Use --max-corpus-for-mining 0 to use full corpus (slow!)."
+        ),
+    )
+    parser.add_argument(
+        "--court-sample", type=int, default=0,
+        help=(
+            "How many court_considerations docs to add to mining corpus (default: 0). "
+            "data.md says you can skip court entirely to start. "
+            "laws_de (175k) + gold citations already gives good hard negatives."
+        ),
+    )
     args = parser.parse_args()
 
     query_mode = args.query_mode
@@ -276,6 +341,29 @@ def main():
     queries_orig, positives, missed = expand_pairs(train_df, corpus)
     total = len(queries_orig) + missed
     print(f"  Pairs built: {len(queries_orig):,} / {total:,} (missed {missed:,} citations not in corpus)")
+
+    # --- Build smart mining corpus ---
+    # Strategy (from user insight + data.md):
+    #   1. All gold citations from train.csv  → pasti relevan, harus ada (~3-5k unik)
+    #   2. All laws_de.csv                   → hanya 175k, manageable, semua pasal relevan
+    #   3. court_considerations: data.md says "you can start without this" — skip or small sample
+    # Total: ~180k vs 2.16M sebelumnya
+    gold_texts = set(positives)  # teks dari gold citations yang sudah matched
+    laws_corpus = load_corpus(cfg.data.laws_csv, "")  # laws saja
+    mining_corpus = dict(laws_corpus)  # mulai dari semua laws (175k)
+    # Pastikan semua gold citation texts masuk ke mining corpus
+    for cit, text in corpus.items():
+        if text in gold_texts:
+            mining_corpus[cit] = text
+    court_sample = args.court_sample
+    if court_sample > 0 and os.path.exists(cfg.data.court_csv):
+        court_df = pd.read_csv(cfg.data.court_csv, nrows=court_sample).dropna(subset=["citation", "text"])
+        for _, row in court_df.iterrows():
+            if row["citation"] not in mining_corpus:
+                mining_corpus[row["citation"]] = row["text"]
+        print(f"  Added {court_sample:,} court docs sample to mining corpus")
+    print(f"  Smart mining corpus: {len(mining_corpus):,} docs "
+          f"(gold citations + all laws + {court_sample:,} court sample)")
 
     # --- 4. Build query variants ---
     print(f"[4/5] Building query variants (mode={query_mode})...")
@@ -312,7 +400,7 @@ def main():
         negatives = mine_hard_negatives(
             queries=raw_queries,
             positives=raw_positives,
-            corpus=corpus,
+            corpus=mining_corpus,
             model_name=cfg.model.base_model,
             hard_neg_per_query=cfg.data.hard_neg_per_query,
             hard_neg_margin=cfg.data.hard_neg_margin,
@@ -320,6 +408,7 @@ def main():
             corpus_chunk_size=cfg.data.corpus_chunk_size,
             query_prefix=cfg.model.query_prefix,
             passage_prefix=cfg.model.passage_prefix,
+            max_corpus_docs=len(mining_corpus),  # no extra cap — already smart-sized
         )
         negatives = [cfg.model.passage_prefix + n for n in negatives]
     else:
