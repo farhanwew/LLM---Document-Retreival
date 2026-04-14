@@ -40,8 +40,8 @@ class ModelConfig:
     query_prefix: str = "query: "
     passage_prefix: str = "passage: "
 
-    query_max_length: int = 512
-    passage_max_length: int = 512
+    # Reduced from 512 to save VRAM — legal snippets are long but 256 covers most
+    max_seq_length: int = 512
 
 
 @dataclass
@@ -50,7 +50,7 @@ class TrainConfig:
 
     # Hyperparams: ShawhinT framework + NVIDIA values
     num_epochs: int = 3
-    batch_size: int = 16
+    batch_size: int = 16  # per-device; seq_len=128 makes e5-large fit on P100 16GB
     learning_rate: float = 1e-5        # NVIDIA: 1e-5 for large models
     warmup_ratio: float = 0.1          # ShawhinT: 0.1
     weight_decay: float = 0.01         # NVIDIA: 0.01

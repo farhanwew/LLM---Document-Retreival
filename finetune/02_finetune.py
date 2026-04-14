@@ -92,7 +92,10 @@ def main():
     parser.add_argument("--run-name", type=str, default=None,
                         help="Name for model output directory. Defaults to 'scenario-{query_mode}'")
     parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Per-device batch size. Default 4 for P100 16GB.")
+    parser.add_argument("--no-fp16", action="store_true",
+                        help="Disable fp16 (use if GPU doesn't support it)")
     args = parser.parse_args()
 
     query_mode = args.query_mode
@@ -129,10 +132,33 @@ def main():
     print(f"\n[2/4] Loading base model: {cfg.model.base_model}")
     model = SentenceTransformer(cfg.model.base_model)
 
+    # Reduce max sequence length to save VRAM
+    # Legal texts are long but 256 tokens covers most article snippets
+    # Data analysis shows: 93.9% of corpus docs < 128 tokens, mean=57
+    # 128 covers almost all docs with 16x less memory than 512
+    model.max_seq_length = 128
+    print(f"  max_seq_length set to {model.max_seq_length} (93.9% docs fit fully)")
+
     # --- Loss (ShawhinT: MNRL) ---
     # MultipleNegativesRankingLoss: treats all other positives in batch as negatives.
     # Works well because BatchSamplers.NO_DUPLICATES prevents same anchor appearing twice.
     loss = MultipleNegativesRankingLoss(model)
+
+    # --- Detect GPU capability for fp16 ---
+    import torch
+    use_fp16 = torch.cuda.is_available() and not args.no_fp16
+    if use_fp16:
+        try:
+            _ = torch.zeros(1, dtype=torch.float16).cuda()
+            print("  fp16 enabled — halves VRAM usage")
+        except Exception:
+            use_fp16 = False
+            print("  fp16 not available, using fp32")
+
+    # Gradient checkpointing — recompute activations during backward instead of storing
+    # Saves ~60% VRAM, ~20% slower. Critical for large models on P100.
+    model[0].auto_model.gradient_checkpointing_enable()
+    print("  gradient checkpointing enabled — saves ~60% activation memory")
 
     # --- Val evaluator ---
     print("\n[3/4] Building val evaluator (English queries → German docs)...")
@@ -144,17 +170,26 @@ def main():
         passage_prefix=cfg.model.passage_prefix,
     )
 
+    # --- Effective batch size via gradient accumulation ---
+    # MNRL benefits from large effective batch (more in-batch negatives)
+    # But actual batch per device must be small to fit in VRAM
+    # effective_batch = batch_size × grad_accum_steps
+    grad_accum = max(1, 16 // batch_size)  # target effective batch of 16
+    print(f"\n  Batch per device: {batch_size}  ×  grad_accum: {grad_accum}"
+          f"  =  effective batch: {batch_size * grad_accum}")
+
     # --- Training args (ShawhinT structure + NVIDIA hyperparams) ---
     train_args = SentenceTransformerTrainingArguments(
         output_dir=str(output_dir),
         num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
-        learning_rate=cfg.train.learning_rate,       # NVIDIA: 1e-5
-        warmup_ratio=cfg.train.warmup_ratio,          # ShawhinT: 0.1
-        weight_decay=cfg.train.weight_decay,          # NVIDIA: 0.01
+        gradient_accumulation_steps=grad_accum,
+        learning_rate=cfg.train.learning_rate,          # NVIDIA: 1e-5
+        warmup_ratio=cfg.train.warmup_ratio,             # ShawhinT: 0.1
+        weight_decay=cfg.train.weight_decay,             # NVIDIA: 0.01
         lr_scheduler_type=cfg.train.lr_scheduler_type,  # NVIDIA: cosine
-        batch_sampler=BatchSamplers.NO_DUPLICATES,   # ShawhinT: required for MNRL
+        batch_sampler=BatchSamplers.NO_DUPLICATES,       # ShawhinT: required for MNRL
         eval_strategy="steps",
         eval_steps=cfg.train.eval_steps,
         logging_steps=cfg.train.logging_steps,
@@ -163,8 +198,10 @@ def main():
         load_best_model_at_end=True,
         metric_for_best_model="swiss-legal-val_cosine_ndcg@10",
         greater_is_better=True,
-        fp16=False,          # set True if GPU supports it
-        bf16=False,          # set True on A100/H100
+        fp16=use_fp16,
+        bf16=False,       # set True on A100/H100 only
+        dataloader_pin_memory=False,
+        dataloader_drop_last=True,    # avoid DDP hang on uneven last batch
         report_to="none",
     )
 
