@@ -1,7 +1,0 @@
-torch>=2.0.0
-transformers>=4.40.0
-bm25s[full]>=0.2.0
-scipy>=1.11.0
-numpy>=1.24.0
-pandas>=2.0.0
-tqdm>=4.65.0
