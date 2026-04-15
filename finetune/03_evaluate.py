@@ -84,13 +84,20 @@ def ndcg_at_k(all_predicted: list[list[str]], all_gold: list[list[str]], k: int)
 # Retrieval
 # ---------------------------------------------------------------------------
 
-def load_corpus(laws_path: str, court_path: str) -> tuple[list[str], list[str]]:
-    """Returns (citations, texts) lists."""
+def load_corpus(laws_path: str, court_path: str, court_sample: int = 0) -> tuple[list[str], list[str]]:
+    """Returns (citations, texts) lists.
+    court_sample=0 skips court docs entirely (fast); set >0 to include a random sample.
+    """
     parts = []
-    for path in [laws_path, court_path]:
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            parts.append(df[["citation", "text"]].dropna())
+    if os.path.exists(laws_path):
+        df = pd.read_csv(laws_path)
+        parts.append(df[["citation", "text"]].dropna())
+    if court_sample > 0 and os.path.exists(court_path):
+        df = pd.read_csv(court_path)
+        df = df[["citation", "text"]].dropna()
+        if len(df) > court_sample:
+            df = df.sample(n=court_sample, random_state=42)
+        parts.append(df)
     corpus_df = pd.concat(parts, ignore_index=True)
     return corpus_df["citation"].tolist(), corpus_df["text"].tolist()
 
@@ -103,7 +110,8 @@ def retrieve_for_model(
     query_prefix: str,
     passage_prefix: str,
     top_k: int = 50,
-    batch_size: int = 64,
+    batch_size: int = 256,
+    multi_gpu: bool = False,
 ) -> list[list[str]]:
     """Encode queries + corpus, return top-K citation lists per query."""
     prefixed_queries = [query_prefix + q for q in val_queries]
@@ -114,8 +122,17 @@ def retrieve_for_model(
                           show_progress_bar=False, normalize_embeddings=True)
 
     print(f"    Encoding corpus ({len(corpus_texts):,} docs)...")
-    c_embs = model.encode(prefixed_corpus, batch_size=batch_size,
-                          show_progress_bar=True, normalize_embeddings=True)
+    if multi_gpu:
+        import torch
+        n_gpu = torch.cuda.device_count()
+        devices = [f"cuda:{i}" for i in range(n_gpu)]
+        pool = model.start_multi_process_pool(devices)
+        c_embs = model.encode_multi_process(prefixed_corpus, pool, batch_size=batch_size)
+        model.stop_multi_process_pool(pool)
+        c_embs = c_embs / np.linalg.norm(c_embs, axis=1, keepdims=True)
+    else:
+        c_embs = model.encode(prefixed_corpus, batch_size=batch_size,
+                              show_progress_bar=True, normalize_embeddings=True)
 
     scores = q_embs @ c_embs.T  # (n_queries, n_corpus)
     top_indices = np.argsort(scores, axis=1)[:, ::-1][:, :top_k]
@@ -135,6 +152,10 @@ def main():
     )
     parser.add_argument("--top-k", type=int, default=20,
                         help="Retrieve this many docs per query for F1 computation")
+    parser.add_argument("--court-sample", type=int, default=0,
+                        help="Include N random court docs in corpus (default 0 = laws_de only, ~175k docs)")
+    parser.add_argument("--multi-gpu", action="store_true",
+                        help="Use all available GPUs for corpus encoding")
     args = parser.parse_args()
 
     model_names = args.models or [
@@ -161,9 +182,26 @@ def main():
     print(f"Val queries: {len(val_queries)}")
 
     # --- Load corpus ---
-    print("Loading corpus...")
-    corpus_citations, corpus_texts = load_corpus(cfg.data.laws_csv, cfg.data.court_csv)
-    print(f"Corpus: {len(corpus_citations):,} docs\n")
+    print(f"Loading corpus (laws_de + {args.court_sample:,} court samples)...")
+    corpus_citations, corpus_texts = load_corpus(cfg.data.laws_csv, cfg.data.court_csv, args.court_sample)
+
+    # Always add gold citations from val.csv to corpus — they may come from court docs
+    # not included in laws_de. Without this, F1=0 even if retrieval works correctly.
+    citation_to_text_all = {}
+    for path in [cfg.data.laws_csv, cfg.data.court_csv]:
+        if os.path.exists(path):
+            df = pd.read_csv(path)[["citation", "text"]].dropna()
+            citation_to_text_all.update(dict(zip(df["citation"], df["text"])))
+
+    existing = set(corpus_citations)
+    for gold_list in gold_all:
+        for cit in gold_list:
+            if cit not in existing and cit in citation_to_text_all:
+                corpus_citations.append(cit)
+                corpus_texts.append(citation_to_text_all[cit])
+                existing.add(cit)
+
+    print(f"Corpus: {len(corpus_citations):,} docs (laws_de + gold citations from val.csv)\n")
 
     # --- Evaluate each model ---
     results = {}
@@ -181,6 +219,7 @@ def main():
 
         print(f"Evaluating: {label}")
         model = SentenceTransformer(model_path)
+        model.max_seq_length = 128  # match training setting; 93.9% docs fit fully
 
         retrieved = retrieve_for_model(
             model=model,
@@ -190,7 +229,8 @@ def main():
             query_prefix=cfg.model.query_prefix,
             passage_prefix=cfg.model.passage_prefix,
             top_k=args.top_k,
-            batch_size=64,
+            batch_size=256,  # no backprop → more VRAM headroom than training
+            multi_gpu=args.multi_gpu,
         )
 
         results[label] = {

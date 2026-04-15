@@ -40,8 +40,8 @@ class ModelConfig:
     query_prefix: str = "query: "
     passage_prefix: str = "passage: "
 
-    # Reduced from 512 to save VRAM — legal snippets are long but 256 covers most
-    max_seq_length: int = 512
+    # 128 covers 93.9% of corpus docs (mean=57 tokens); hardcoded in 02_finetune.py
+    max_seq_length: int = 256
 
 
 @dataclass
