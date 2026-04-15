@@ -203,6 +203,7 @@ def main():
         dataloader_pin_memory=False,
         dataloader_drop_last=True,    # avoid DDP hang on uneven last batch
         report_to="none",
+        save_only_model=True,         # skip optimizer state — saves ~4GB disk per checkpoint
     )
 
     # --- Train (ShawhinT: SentenceTransformerTrainer) ---
