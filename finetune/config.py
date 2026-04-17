@@ -27,7 +27,7 @@ class DataConfig:
     mine_hard_negatives: bool = True
     hard_neg_per_query: int = 4        # 1 pos + 4 neg = 5 passages per query (NVIDIA: train_n_passages=5)
     hard_neg_margin: float = 0.95      # From NVIDIA config
-    mining_batch_size: int = 64
+    mining_batch_size: int = 512  # no backprop during mining → can use large batch
     corpus_chunk_size: int = 50_000    # From NVIDIA config
 
 
