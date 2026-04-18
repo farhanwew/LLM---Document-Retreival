@@ -277,16 +277,23 @@ def mine_hard_negatives(
                 break
         query_to_hardnegs[q] = hard_negs
 
-    # Expand to per-pair negatives (one negative per pair, cycling if few)
-    negatives = []
+    # Expand rows: each hard negative becomes its own (anchor, positive, negative) row.
+    # Cap at 2 per pair to keep dataset size manageable within Kaggle 12h budget.
+    max_negs_per_pair = 2
+    expanded_queries, expanded_positives, expanded_negatives = [], [], []
     for q, p in zip(queries, positives):
-        negs = query_to_hardnegs.get(q, [])
+        negs = query_to_hardnegs.get(q, [])[:max_negs_per_pair]
         if negs:
-            negatives.append(negs[0])
+            for neg in negs:
+                expanded_queries.append(q)
+                expanded_positives.append(p)
+                expanded_negatives.append(neg)
         else:
-            negatives.append("")  # fallback; filtered later
+            expanded_queries.append(q)
+            expanded_positives.append(p)
+            expanded_negatives.append("")  # filtered later
 
-    return negatives
+    return expanded_queries, expanded_positives, expanded_negatives
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +423,7 @@ def main():
     mine = cfg.data.mine_hard_negatives and not args.no_hard_negatives
     if mine:
         print("[5/5] Mining hard negatives...")
-        negatives = mine_hard_negatives(
+        final_queries, final_positives, negatives = mine_hard_negatives(
             queries=final_queries,
             positives=final_positives,
             corpus=mining_corpus,
@@ -441,7 +448,7 @@ def main():
         valid = [(q, p, n) for q, p, n in zip(final_queries, final_positives, negatives) if n.strip()]
         final_queries, final_positives, negatives = zip(*valid) if valid else ([], [], [])
         final_queries, final_positives, negatives = list(final_queries), list(final_positives), list(negatives)
-        print(f"  Kept {len(final_queries):,} / {before:,} pairs with valid hard negatives")
+        print(f"  Kept {len(final_queries):,} / {before:,} expanded rows with valid hard negatives")
 
     # --- 6. Save dataset ---
     print("\nSaving dataset...")

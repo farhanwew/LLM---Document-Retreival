@@ -89,10 +89,32 @@ class TrainConfig:
 
 
 @dataclass
+class InferenceConfig:
+    # Variable-K retrieval (threshold-based, better Macro F1 than fixed top-K)
+    # Calibrate score_threshold on val.csv by sweeping 0.70–0.90 in steps of 0.02
+    score_threshold: float = 0.78   # cosine similarity cutoff (normalized embeddings)
+    min_k: int = 1                  # always return at least this many citations
+    max_k: int = 20                 # cap to avoid excessive false positives
+
+
+@dataclass
+class RerankConfig:
+    reranker_model_path: str = "finetune/models/bge-reranker-v2-m3"
+    rerank_top_n: int = 50          # bi-encoder candidates fed to cross-encoder
+    reranker_batch_size: int = 32
+    # BGE reranker returns raw logits (not 0-1 probabilities); calibrate on val
+    reranker_score_threshold: float = 0.0   # logit threshold; sweep on val
+    min_k: int = 1
+    max_k: int = 20
+
+
+@dataclass
 class FinetuneConfig:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    inference: InferenceConfig = field(default_factory=InferenceConfig)
+    rerank: RerankConfig = field(default_factory=RerankConfig)
 
 
 # Singleton for easy import (defaults to e5-large)

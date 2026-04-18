@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import numpy as np
 import pandas as pd
 from datasets import DatasetDict, load_from_disk
 from sentence_transformers import (
@@ -25,7 +26,7 @@ from sentence_transformers import (
     SentenceTransformerTrainer,
     SentenceTransformerTrainingArguments,
 )
-from sentence_transformers.evaluation import InformationRetrievalEvaluator
+from sentence_transformers.evaluation import SentenceEvaluator
 from sentence_transformers.losses import MultipleNegativesRankingLoss
 from sentence_transformers.training_args import BatchSamplers
 
@@ -33,12 +34,84 @@ from finetune.config import cfg, get_model_config
 from finetune.logger import setup_logger
 
 
+class SwissLegalF1Evaluator(SentenceEvaluator):
+    """
+    Evaluator that computes Macro F1 at K (competition metric) on val.csv.
+    Returns key 'swiss-legal-val_macro_f1' so metric_for_best_model can find it.
+    Val is only 10 queries so F1 is noisy — use as a tiebreaker, not gospel.
+    """
+
+    def __init__(self, queries: dict, corpus: dict, relevant_docs: dict,
+                 name: str = "swiss-legal-val", k_values: tuple = (5, 10, 20),
+                 query_prefix: str = "", passage_prefix: str = "",
+                 query_prompt_name: str = "", passage_prompt_name: str = ""):
+        self.queries = queries           # {qid: query_str}
+        self.corpus = corpus             # {docid: doc_str}
+        self.relevant_docs = relevant_docs  # {qid: set of docids}
+        self.name = name
+        self.k_values = k_values
+        self.query_prefix = query_prefix
+        self.passage_prefix = passage_prefix
+        self.query_prompt_name = query_prompt_name
+        self.passage_prompt_name = passage_prompt_name
+        self.primary_metric = f"{name}_macro_f1"  # required by ST ≥3.0
+
+    def __call__(self, model, output_path=None, epoch=-1, steps=-1):
+        q_ids = list(self.queries.keys())
+        c_ids = list(self.corpus.keys())
+
+        if self.query_prompt_name:
+            q_embs = model.encode(
+                list(self.queries.values()), prompt_name=self.query_prompt_name,
+                normalize_embeddings=True, show_progress_bar=False, batch_size=256,
+            )
+        else:
+            q_embs = model.encode(
+                [self.query_prefix + v for v in self.queries.values()],
+                normalize_embeddings=True, show_progress_bar=False, batch_size=256,
+            )
+
+        if self.passage_prompt_name:
+            c_embs = model.encode(
+                list(self.corpus.values()), prompt_name=self.passage_prompt_name,
+                normalize_embeddings=True, show_progress_bar=False, batch_size=256,
+            )
+        else:
+            c_embs = model.encode(
+                [self.passage_prefix + v for v in self.corpus.values()],
+                normalize_embeddings=True, show_progress_bar=False, batch_size=256,
+            )
+
+        scores = q_embs @ c_embs.T  # (n_queries, n_corpus)
+        metrics = {}
+
+        for k in self.k_values:
+            top_idx = np.argsort(scores, axis=1)[:, ::-1][:, :k]
+            all_f1 = []
+            for i, qid in enumerate(q_ids):
+                pred_set = {c_ids[j] for j in top_idx[i]}
+                gold_set = self.relevant_docs.get(qid, set())
+                if not pred_set and not gold_set:
+                    all_f1.append(1.0)
+                elif not pred_set or not gold_set:
+                    all_f1.append(0.0)
+                else:
+                    tp = len(pred_set & gold_set)
+                    p = tp / len(pred_set)
+                    r = tp / len(gold_set)
+                    all_f1.append(2 * p * r / (p + r) if (p + r) > 0 else 0.0)
+            metrics[f"{self.name}_macro_f1@{k}"] = float(np.mean(all_f1))
+
+        metrics[self.primary_metric] = metrics[f"{self.name}_macro_f1@10"]
+        return metrics
+
+
 def build_val_evaluator(val_csv: str, laws_csv: str, court_csv: str,
                         query_prefix: str, passage_prefix: str,
                         query_prompt_name: str = "",
-                        passage_prompt_name: str = "") -> InformationRetrievalEvaluator:
+                        passage_prompt_name: str = "") -> SwissLegalF1Evaluator:
     """
-    Build InformationRetrievalEvaluator from val.csv + corpus.
+    Build SwissLegalF1Evaluator from val.csv + corpus.
     Val queries are English — matches the test distribution.
     """
     val_df = pd.read_csv(val_csv)
@@ -53,36 +126,39 @@ def build_val_evaluator(val_csv: str, laws_csv: str, court_csv: str,
     citation_to_text = dict(zip(corpus_df["citation"], corpus_df["text"]))
 
     # Build evaluator inputs
-    queries = {}      # qid -> query string
-    corpus = {}       # docid -> doc string
+    queries = {}      # qid -> query string (raw, prefix applied inside evaluator)
+    corpus = {}       # docid -> doc string (raw)
     relevant_docs = {}  # qid -> set of relevant docids
 
     for _, row in val_df.iterrows():
         qid = str(row["query_id"])
-        queries[qid] = query_prefix + str(row["query"])
+        queries[qid] = str(row["query"])
         if pd.isna(row.get("gold_citations", None)):
             continue
         citations = [c.strip() for c in str(row["gold_citations"]).split(";")]
         relevant_docs[qid] = set()
         for cit in citations:
             if cit in citation_to_text:
-                corpus[cit] = passage_prefix + citation_to_text[cit]
+                corpus[cit] = citation_to_text[cit]
                 relevant_docs[qid].add(cit)
 
     # Add distractor docs for realistic evaluation
     pos_cits = set(corpus.keys())
     distractors = [c for c in citation_to_text if c not in pos_cits][:5000]
     for cit in distractors:
-        corpus[cit] = passage_prefix + citation_to_text[cit]
+        corpus[cit] = citation_to_text[cit]
 
     print(f"  Val evaluator: {len(queries)} queries, {len(corpus):,} corpus docs")
 
-    return InformationRetrievalEvaluator(
+    return SwissLegalF1Evaluator(
         queries=queries,
         corpus=corpus,
         relevant_docs=relevant_docs,
         name="swiss-legal-val",
-        show_progress_bar=False,
+        query_prefix=query_prefix,
+        passage_prefix=passage_prefix,
+        query_prompt_name=query_prompt_name,
+        passage_prompt_name=passage_prompt_name,
     )
 
 
@@ -136,9 +212,15 @@ def main():
     print(f"  Train: {len(ds['train']):,}  Eval: {len(ds['eval']):,}")
     print(f"  Columns: {ds['train'].column_names}")
 
-    # MultipleNegativesRankingLoss only needs (anchor, positive)
-    # If we have hard negatives, they act as additional in-batch negatives naturally
-    train_dataset = ds["train"].select_columns(["anchor", "positive"])
+    # Use hard negatives if present — MNRL treats the "negative" column as an
+    # explicit hard negative per triplet, giving stronger gradient signal.
+    train_cols = ["anchor", "positive"]
+    if "negative" in ds["train"].column_names:
+        train_cols.append("negative")
+        print(f"  Hard negatives column found — using triplet training")
+    else:
+        print(f"  No hard negatives column — using in-batch negatives only")
+    train_dataset = ds["train"].select_columns(train_cols)
 
     # --- Load model (ShawhinT approach) ---
     print(f"\n[2/4] Loading base model: {mcfg.base_model}")
@@ -224,7 +306,7 @@ def main():
         save_strategy="steps",
         save_steps=cfg.train.eval_steps,
         load_best_model_at_end=True,
-        metric_for_best_model="swiss-legal-val_cosine_ndcg@10",
+        metric_for_best_model="swiss-legal-val_macro_f1",
         greater_is_better=True,
         fp16=use_fp16,
         bf16=False,       # set True on A100/H100 only
@@ -242,7 +324,7 @@ def main():
         model=model,
         args=train_args,
         train_dataset=train_dataset,
-        eval_dataset=ds["eval"].select_columns(["anchor", "positive"]),
+        eval_dataset=ds["eval"].select_columns(train_cols),
         loss=loss,
         evaluator=evaluator,
     )

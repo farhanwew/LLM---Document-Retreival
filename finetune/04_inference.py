@@ -61,8 +61,7 @@ def retrieve_top_k(
     citations: list[str],
     top_k: int,
 ) -> list[list[str]]:
-    """Dot product similarity, return top-K citation lists per query."""
-    # Process in batches to avoid memory spike on large corpus
+    """Dot product similarity, return fixed top-K citation lists per query."""
     results = []
     batch = 64
     for i in range(0, len(q_embs), batch):
@@ -71,6 +70,77 @@ def retrieve_top_k(
         for row in top_idx:
             results.append([citations[j] for j in row])
     return results
+
+
+def retrieve_variable_k(
+    q_embs: np.ndarray,
+    c_embs: np.ndarray,
+    citations: list[str],
+    score_threshold: float,
+    min_k: int = 1,
+    max_k: int = 20,
+) -> list[list[str]]:
+    """
+    Variable-K retrieval: returns all citations above score_threshold per query.
+    Always returns at least min_k (prevents empty predictions which destroy F1).
+    Caps at max_k to avoid excessive false positives.
+    Calibrate score_threshold on val.csv before submitting (sweep 0.70–0.90).
+    Note: assumes normalized embeddings (cosine = dot product).
+    """
+    results = []
+    batch = 64
+    for i in range(0, len(q_embs), batch):
+        scores = q_embs[i:i+batch] @ c_embs.T  # (batch, n_corpus)
+        for row_scores in scores:
+            sorted_idx = np.argsort(row_scores)[::-1]
+            forced = [citations[j] for j in sorted_idx[:min_k]]
+            additional = [
+                citations[j] for j in sorted_idx[min_k:max_k]
+                if row_scores[j] >= score_threshold
+            ]
+            results.append(forced + additional)
+    return results
+
+
+def threshold_sweep(
+    q_embs: np.ndarray,
+    c_embs: np.ndarray,
+    citations: list[str],
+    gold_all: list[list[str]],
+    thresholds: list[float],
+    min_k: int = 1,
+    max_k: int = 20,
+) -> None:
+    """Sweep thresholds on val set and print Macro F1 for each. Use before final submission."""
+    import numpy as np
+
+    def compute_f1(pred, gold):
+        ps, gs = set(pred), set(gold)
+        if not ps and not gs:
+            return 1.0
+        if not ps or not gs:
+            return 0.0
+        tp = len(ps & gs)
+        p, r = tp / len(ps), tp / len(gs)
+        return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+
+    scores_matrix = q_embs @ c_embs.T
+    print("\nThreshold sweep on val:")
+    print(f"  {'threshold':>10}  {'macro_f1':>10}  {'avg_cits':>10}")
+    for t in thresholds:
+        preds, lengths = [], []
+        for row_scores in scores_matrix:
+            sorted_idx = np.argsort(row_scores)[::-1]
+            forced = [citations[j] for j in sorted_idx[:min_k]]
+            additional = [
+                citations[j] for j in sorted_idx[min_k:max_k]
+                if row_scores[j] >= t
+            ]
+            p = forced + additional
+            preds.append(p)
+            lengths.append(len(p))
+        f1 = float(np.mean([compute_f1(p, g) for p, g in zip(preds, gold_all)]))
+        print(f"  {t:>10.2f}  {f1:>10.4f}  {np.mean(lengths):>10.1f}")
 
 
 def main():
@@ -91,6 +161,16 @@ def main():
     )
     parser.add_argument("--log-file", type=str, default=None,
                         help="Save all output to this file (default: finetune/logs/inference_{model}.txt)")
+    parser.add_argument("--score-threshold", type=float, default=None,
+                        help="Cosine similarity threshold for variable-K retrieval. "
+                             "If set, overrides --top-k. Calibrate on val.csv (sweep 0.70–0.90). "
+                             "Default: None (use fixed --top-k)")
+    parser.add_argument("--min-k", type=int, default=cfg.inference.min_k,
+                        help="Min citations per query for variable-K (default: 1)")
+    parser.add_argument("--max-k", type=int, default=cfg.inference.max_k,
+                        help="Max citations per query for variable-K (default: 20)")
+    parser.add_argument("--sweep-val", action="store_true",
+                        help="Before writing submission, sweep thresholds on val.csv to find best score_threshold")
     args = parser.parse_args()
     mcfg = get_model_config(args.model_type)
     log_file = args.log_file or f"finetune/logs/inference_{args.model}.txt"
@@ -169,9 +249,49 @@ def main():
         chunk_size=50_000,
     )
 
+    # --- Optional: sweep thresholds on val.csv before writing submission ---
+    if args.sweep_val and os.path.exists(cfg.data.val_csv):
+        print("\nSweeping thresholds on val.csv...")
+        val_df = pd.read_csv(cfg.data.val_csv)
+        val_queries_sw = val_df["query"].tolist()
+        gold_sw = []
+        for _, row in val_df.iterrows():
+            if pd.isna(row.get("gold_citations", None)):
+                gold_sw.append([])
+            else:
+                gold_sw.append([c.strip() for c in str(row["gold_citations"]).split(";")])
+
+        if mcfg.query_prompt_name:
+            q_embs_val = model.encode(val_queries_sw, prompt_name=mcfg.query_prompt_name,
+                                      batch_size=args.batch_size, normalize_embeddings=True,
+                                      show_progress_bar=False)
+        else:
+            q_embs_val = model.encode([mcfg.query_prefix + q for q in val_queries_sw],
+                                      batch_size=args.batch_size, normalize_embeddings=True,
+                                      show_progress_bar=False)
+        threshold_sweep(
+            q_embs=q_embs_val,
+            c_embs=c_embs,
+            citations=corpus_citations,
+            gold_all=gold_sw,
+            thresholds=[round(t, 2) for t in np.arange(0.60, 0.92, 0.02)],
+            min_k=args.min_k,
+            max_k=args.max_k,
+        )
+
     # --- Retrieve ---
-    print(f"\n  Retrieving top-{args.top_k} per query...")
-    predictions = retrieve_top_k(q_embs, c_embs, corpus_citations, args.top_k)
+    if args.score_threshold is not None:
+        print(f"\n  Retrieving with score_threshold={args.score_threshold} "
+              f"(min_k={args.min_k}, max_k={args.max_k})...")
+        predictions = retrieve_variable_k(
+            q_embs, c_embs, corpus_citations,
+            score_threshold=args.score_threshold,
+            min_k=args.min_k,
+            max_k=args.max_k,
+        )
+    else:
+        print(f"\n  Retrieving fixed top-{args.top_k} per query...")
+        predictions = retrieve_top_k(q_embs, c_embs, corpus_citations, args.top_k)
 
     # --- Write submission ---
     rows = []
