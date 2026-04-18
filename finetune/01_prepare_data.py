@@ -35,7 +35,8 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 from transformers import MarianMTModel, MarianTokenizer
 
-from finetune.config import cfg
+from finetune.config import cfg, get_model_config, ModelConfig
+from finetune.logger import setup_logger
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +168,8 @@ def mine_hard_negatives(
     corpus_chunk_size: int,
     query_prefix: str,
     passage_prefix: str,
+    query_prompt_name: str = "",
+    passage_prompt_name: str = "",
     max_corpus_docs: int = 100_000,
 ) -> list[str]:
     """
@@ -181,6 +184,7 @@ def mine_hard_negatives(
     print(f"  Loading model for hard negative mining...")
 
     model = SentenceTransformer(model_name, device=device)
+    model.max_seq_length = 128
 
     # Adjust batch size for CPU (much smaller to avoid slowness spiral)
     encode_batch = mining_batch_size if device == "cuda" else 16
@@ -192,15 +196,18 @@ def mine_hard_negatives(
 
     # Get unique queries
     unique_queries = list(set(queries))
-    prefixed_queries = [query_prefix + q for q in unique_queries]
 
     print(f"  Encoding {len(unique_queries):,} unique queries...")
-    query_embs = model.encode(
-        prefixed_queries,
-        batch_size=encode_batch,
-        show_progress_bar=True,
-        normalize_embeddings=True,
-    )
+    if query_prompt_name:
+        query_embs = model.encode(
+            unique_queries, prompt_name=query_prompt_name,
+            batch_size=encode_batch, show_progress_bar=True, normalize_embeddings=True,
+        )
+    else:
+        query_embs = model.encode(
+            [query_prefix + q for q in unique_queries],
+            batch_size=encode_batch, show_progress_bar=True, normalize_embeddings=True,
+        )
 
     # Cap corpus size for mining — 2M+ docs is impractical on CPU
     # Prefer to keep docs that are actually gold citations (higher mining signal)
@@ -221,18 +228,20 @@ def mine_hard_negatives(
         print(f"  Mining corpus: {len(corpus_citations):,} docs "
               f"({len(priority_idx):,} gold positives + {len(keep_idx)-len(priority_idx):,} random)")
 
-    prefixed_texts = [passage_prefix + t for t in corpus_texts]
-
     print(f"  Encoding corpus ({len(corpus_texts):,} docs) in chunks of {corpus_chunk_size:,}...")
     corpus_embs = []
-    for start in tqdm(range(0, len(prefixed_texts), corpus_chunk_size), desc="Corpus chunks"):
-        chunk = prefixed_texts[start: start + corpus_chunk_size]
-        emb = model.encode(
-            chunk,
-            batch_size=encode_batch,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-        )
+    for start in tqdm(range(0, len(corpus_texts), corpus_chunk_size), desc="Corpus chunks"):
+        chunk = corpus_texts[start: start + corpus_chunk_size]
+        if passage_prompt_name:
+            emb = model.encode(
+                chunk, prompt_name=passage_prompt_name,
+                batch_size=encode_batch, show_progress_bar=False, normalize_embeddings=True,
+            )
+        else:
+            emb = model.encode(
+                [passage_prefix + t for t in chunk],
+                batch_size=encode_batch, show_progress_bar=False, normalize_embeddings=True,
+            )
         corpus_embs.append(emb)
     corpus_embs = np.concatenate(corpus_embs, axis=0)
 
@@ -296,6 +305,10 @@ def main():
             "both: use original + translated (doubles training pairs)."
         ),
     )
+    parser.add_argument(
+        "--model", choices=["e5-large", "gemma"], default="e5-large",
+        help="Embedding model to use. Determines output dir and encoding strategy.",
+    )
     parser.add_argument("--no-hard-negatives", action="store_true",
                         help="Skip hard negative mining (faster, lower quality)")
     parser.add_argument(
@@ -315,14 +328,24 @@ def main():
             "laws_de (175k) + gold citations already gives good hard negatives."
         ),
     )
+    parser.add_argument("--log-file", type=str, default=None,
+                        help="Save all output to this file (default: finetune/logs/prepare_{model}_{mode}.txt)")
     args = parser.parse_args()
 
     query_mode = args.query_mode
-    out_dir = Path(cfg.data.prepared_data_root) / query_mode
+    model_type = args.model
+    mcfg = get_model_config(model_type)
+
+    log_file = args.log_file or f"finetune/logs/prepare_{model_type}_{query_mode}.txt"
+    setup_logger(log_file)
+
+    # Separate dirs per model so e5 and gemma data don't overwrite each other
+    out_dir = Path(cfg.data.prepared_data_root) / model_type / query_mode
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"  Preparing data — mode: {query_mode}")
+    print(f"  Preparing data — mode: {query_mode}  model: {model_type}")
+    print(f"  Base model: {mcfg.base_model}")
     print(f"  Output: {out_dir}")
     print(f"{'='*60}\n")
 
@@ -366,14 +389,14 @@ def main():
           f"(gold citations + all laws + {court_sample:,} court sample)")
 
     # --- 4. Build query variants ---
+    # Store raw text (no prefixes/prompts) — applied at training time
     print(f"[4/5] Building query variants (mode={query_mode})...")
     final_queries, final_positives = [], []
 
     if query_mode in ("original", "both"):
-        prefixed_orig = [cfg.model.query_prefix + q for q in queries_orig]
-        final_queries.extend(prefixed_orig)
-        final_positives.extend([cfg.model.passage_prefix + p for p in positives])
-        print(f"  Added {len(prefixed_orig):,} original-language pairs")
+        final_queries.extend(queries_orig)
+        final_positives.extend(positives)
+        print(f"  Added {len(queries_orig):,} original-language pairs")
 
     if query_mode in ("translated", "both"):
         print("  Translating queries to English...")
@@ -383,10 +406,9 @@ def main():
             model_name=cfg.data.translation_model,
             batch_size=cfg.data.translation_batch_size,
         )
-        prefixed_en = [cfg.model.query_prefix + q for q in queries_en]
-        final_queries.extend(prefixed_en)
-        final_positives.extend([cfg.model.passage_prefix + p for p in positives])
-        print(f"  Added {len(prefixed_en):,} English-translated pairs")
+        final_queries.extend(queries_en)
+        final_positives.extend(positives)
+        print(f"  Added {len(queries_en):,} English-translated pairs")
 
     print(f"  Total pairs: {len(final_queries):,}")
 
@@ -394,23 +416,21 @@ def main():
     mine = cfg.data.mine_hard_negatives and not args.no_hard_negatives
     if mine:
         print("[5/5] Mining hard negatives...")
-        # Strip prefixes for mining (model adds them internally via encode)
-        raw_queries = [q[len(cfg.model.query_prefix):] for q in final_queries]
-        raw_positives = [p[len(cfg.model.passage_prefix):] for p in final_positives]
         negatives = mine_hard_negatives(
-            queries=raw_queries,
-            positives=raw_positives,
+            queries=final_queries,
+            positives=final_positives,
             corpus=mining_corpus,
-            model_name=cfg.model.base_model,
+            model_name=mcfg.base_model,
             hard_neg_per_query=cfg.data.hard_neg_per_query,
             hard_neg_margin=cfg.data.hard_neg_margin,
             mining_batch_size=cfg.data.mining_batch_size,
             corpus_chunk_size=cfg.data.corpus_chunk_size,
-            query_prefix=cfg.model.query_prefix,
-            passage_prefix=cfg.model.passage_prefix,
-            max_corpus_docs=len(mining_corpus),  # no extra cap — already smart-sized
+            query_prefix=mcfg.query_prefix,
+            passage_prefix=mcfg.passage_prefix,
+            query_prompt_name=mcfg.query_prompt_name,
+            passage_prompt_name=mcfg.passage_prompt_name,
+            max_corpus_docs=len(mining_corpus),
         )
-        negatives = [cfg.model.passage_prefix + n for n in negatives]
     else:
         print("[5/5] Skipping hard negative mining")
         negatives = [""] * len(final_queries)

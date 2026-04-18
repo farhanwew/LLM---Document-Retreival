@@ -26,7 +26,8 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-from finetune.config import cfg
+from finetune.config import cfg, get_model_config
+from finetune.logger import setup_logger
 
 
 def encode_corpus_chunked(
@@ -36,17 +37,20 @@ def encode_corpus_chunked(
     passage_prefix: str,
     batch_size: int = 256,
     chunk_size: int = 50_000,
+    passage_prompt_name: str = "",
 ) -> np.ndarray:
     """Encode corpus in chunks to manage memory. Returns (n_docs, dim) array."""
     all_embs = []
     for start in tqdm(range(0, len(texts), chunk_size), desc="Corpus chunks"):
-        chunk_texts = [passage_prefix + t for t in texts[start:start + chunk_size]]
-        embs = model.encode(
-            chunk_texts,
-            batch_size=batch_size,
-            show_progress_bar=True,
-            normalize_embeddings=True,
-        )
+        chunk = texts[start:start + chunk_size]
+        if passage_prompt_name:
+            embs = model.encode(chunk, prompt_name=passage_prompt_name,
+                                batch_size=batch_size, show_progress_bar=True,
+                                normalize_embeddings=True)
+        else:
+            embs = model.encode([passage_prefix + t for t in chunk],
+                                batch_size=batch_size, show_progress_bar=True,
+                                normalize_embeddings=True)
         all_embs.append(embs)
     return np.vstack(all_embs)
 
@@ -81,7 +85,16 @@ def main():
                         help="Output path for submission.csv")
     parser.add_argument("--batch-size", type=int, default=256,
                         help="Encoding batch size")
+    parser.add_argument(
+        "--model-type", choices=["e5-large", "gemma"], default="e5-large",
+        help="Embedding model type — controls prefix/prompt strategy.",
+    )
+    parser.add_argument("--log-file", type=str, default=None,
+                        help="Save all output to this file (default: finetune/logs/inference_{model}.txt)")
     args = parser.parse_args()
+    mcfg = get_model_config(args.model_type)
+    log_file = args.log_file or f"finetune/logs/inference_{args.model}.txt"
+    setup_logger(log_file)
 
     # Resolve model path
     model_path = args.model
@@ -136,20 +149,22 @@ def main():
     # --- Encode ---
     print(f"\n[4/4] Encoding...")
     print(f"  Encoding {len(test_queries)} queries...")
-    prefixed_queries = [cfg.model.query_prefix + q for q in test_queries]
-    q_embs = model.encode(
-        prefixed_queries,
-        batch_size=args.batch_size,
-        show_progress_bar=False,
-        normalize_embeddings=True,
-    )
+    if mcfg.query_prompt_name:
+        q_embs = model.encode(test_queries, prompt_name=mcfg.query_prompt_name,
+                               batch_size=args.batch_size, show_progress_bar=False,
+                               normalize_embeddings=True)
+    else:
+        q_embs = model.encode([mcfg.query_prefix + q for q in test_queries],
+                               batch_size=args.batch_size, show_progress_bar=False,
+                               normalize_embeddings=True)
 
     print(f"  Encoding corpus ({len(corpus_texts):,} docs)...")
     c_embs = encode_corpus_chunked(
         model=model,
         citations=corpus_citations,
         texts=corpus_texts,
-        passage_prefix=cfg.model.passage_prefix,
+        passage_prefix=mcfg.passage_prefix,
+        passage_prompt_name=mcfg.passage_prompt_name,
         batch_size=args.batch_size,
         chunk_size=50_000,
     )

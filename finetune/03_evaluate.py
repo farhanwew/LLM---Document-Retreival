@@ -27,7 +27,8 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-from finetune.config import cfg
+from finetune.config import cfg, get_model_config
+from finetune.logger import setup_logger
 
 
 # ---------------------------------------------------------------------------
@@ -112,27 +113,43 @@ def retrieve_for_model(
     top_k: int = 50,
     batch_size: int = 256,
     multi_gpu: bool = False,
+    query_prompt_name: str = "",
+    passage_prompt_name: str = "",
 ) -> list[list[str]]:
     """Encode queries + corpus, return top-K citation lists per query."""
-    prefixed_queries = [query_prefix + q for q in val_queries]
-    prefixed_corpus = [passage_prefix + t for t in corpus_texts]
-
     print(f"    Encoding {len(val_queries)} queries...")
-    q_embs = model.encode(prefixed_queries, batch_size=batch_size,
-                          show_progress_bar=False, normalize_embeddings=True)
+    if query_prompt_name:
+        q_embs = model.encode(val_queries, prompt_name=query_prompt_name,
+                               batch_size=batch_size, show_progress_bar=False,
+                               normalize_embeddings=True)
+    else:
+        q_embs = model.encode([query_prefix + q for q in val_queries],
+                               batch_size=batch_size, show_progress_bar=False,
+                               normalize_embeddings=True)
+
+    prefixed_corpus = (
+        corpus_texts if passage_prompt_name
+        else [passage_prefix + t for t in corpus_texts]
+    )
 
     print(f"    Encoding corpus ({len(corpus_texts):,} docs)...")
+    encode_kwargs = dict(batch_size=batch_size, normalize_embeddings=True)
+    if passage_prompt_name:
+        encode_kwargs["prompt_name"] = passage_prompt_name
+        corpus_input = corpus_texts
+    else:
+        corpus_input = prefixed_corpus
+
     if multi_gpu:
         import torch
         n_gpu = torch.cuda.device_count()
         devices = [f"cuda:{i}" for i in range(n_gpu)]
         pool = model.start_multi_process_pool(devices)
-        c_embs = model.encode_multi_process(prefixed_corpus, pool, batch_size=batch_size)
+        c_embs = model.encode_multi_process(corpus_input, pool, batch_size=batch_size)
         model.stop_multi_process_pool(pool)
         c_embs = c_embs / np.linalg.norm(c_embs, axis=1, keepdims=True)
     else:
-        c_embs = model.encode(prefixed_corpus, batch_size=batch_size,
-                              show_progress_bar=True, normalize_embeddings=True)
+        c_embs = model.encode(corpus_input, show_progress_bar=True, **encode_kwargs)
 
     scores = q_embs @ c_embs.T  # (n_queries, n_corpus)
     top_indices = np.argsort(scores, axis=1)[:, ::-1][:, :top_k]
@@ -156,8 +173,16 @@ def main():
                         help="Include N random court docs in corpus (default 0 = laws_de only, ~175k docs)")
     parser.add_argument("--multi-gpu", action="store_true",
                         help="Use all available GPUs for corpus encoding")
+    parser.add_argument(
+        "--model-type", choices=["e5-large", "gemma"], default="e5-large",
+        help="Embedding model type — controls prefix/prompt strategy.",
+    )
+    parser.add_argument("--log-file", type=str, default="finetune/logs/evaluate.txt",
+                        help="Save all output to this file")
     args = parser.parse_args()
 
+    setup_logger(args.log_file)
+    mcfg = get_model_config(args.model_type)
     model_names = args.models or [
         "scenario1-original",
         "scenario2-translated",
@@ -207,7 +232,7 @@ def main():
     results = {}
 
     # Always include base model for comparison
-    model_configs = [("base (no finetune)", cfg.model.base_model)] + [
+    model_configs = [("base (no finetune)", mcfg.base_model)] + [
         (name, str(models_root / name / "final"))
         for name in model_names
     ]
@@ -226,10 +251,12 @@ def main():
             val_queries=val_queries,
             corpus_citations=corpus_citations,
             corpus_texts=corpus_texts,
-            query_prefix=cfg.model.query_prefix,
-            passage_prefix=cfg.model.passage_prefix,
+            query_prefix=mcfg.query_prefix,
+            passage_prefix=mcfg.passage_prefix,
+            query_prompt_name=mcfg.query_prompt_name,
+            passage_prompt_name=mcfg.passage_prompt_name,
             top_k=args.top_k,
-            batch_size=256,  # no backprop → more VRAM headroom than training
+            batch_size=256,
             multi_gpu=args.multi_gpu,
         )
 

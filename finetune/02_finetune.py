@@ -29,11 +29,14 @@ from sentence_transformers.evaluation import InformationRetrievalEvaluator
 from sentence_transformers.losses import MultipleNegativesRankingLoss
 from sentence_transformers.training_args import BatchSamplers
 
-from finetune.config import cfg
+from finetune.config import cfg, get_model_config
+from finetune.logger import setup_logger
 
 
 def build_val_evaluator(val_csv: str, laws_csv: str, court_csv: str,
-                        query_prefix: str, passage_prefix: str) -> InformationRetrievalEvaluator:
+                        query_prefix: str, passage_prefix: str,
+                        query_prompt_name: str = "",
+                        passage_prompt_name: str = "") -> InformationRetrievalEvaluator:
     """
     Build InformationRetrievalEvaluator from val.csv + corpus.
     Val queries are English — matches the test distribution.
@@ -63,14 +66,12 @@ def build_val_evaluator(val_csv: str, laws_csv: str, court_csv: str,
         relevant_docs[qid] = set()
         for cit in citations:
             if cit in citation_to_text:
-                docid = cit
-                corpus[docid] = passage_prefix + citation_to_text[cit]
-                relevant_docs[qid].add(docid)
+                corpus[cit] = passage_prefix + citation_to_text[cit]
+                relevant_docs[qid].add(cit)
 
-    # Add some distractor docs from corpus (not in val positives) for realistic evaluation
-    all_cits = list(citation_to_text.keys())
+    # Add distractor docs for realistic evaluation
     pos_cits = set(corpus.keys())
-    distractors = [c for c in all_cits if c not in pos_cits][:5000]
+    distractors = [c for c in citation_to_text if c not in pos_cits][:5000]
     for cit in distractors:
         corpus[cit] = passage_prefix + citation_to_text[cit]
 
@@ -81,7 +82,7 @@ def build_val_evaluator(val_csv: str, laws_csv: str, court_csv: str,
         corpus=corpus,
         relevant_docs=relevant_docs,
         name="swiss-legal-val",
-        show_progress_bar=True,
+        show_progress_bar=False,
     )
 
 
@@ -89,25 +90,36 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--query-mode", choices=["original", "translated", "both"],
                         default="both")
+    parser.add_argument(
+        "--model", choices=["e5-large", "gemma"], default="e5-large",
+        help="Embedding model to fine-tune.",
+    )
     parser.add_argument("--run-name", type=str, default=None,
-                        help="Name for model output directory. Defaults to 'scenario-{query_mode}'")
+                        help="Name for model output directory. Defaults to '{model}-{query_mode}'")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Per-device batch size. Default 4 for P100 16GB.")
     parser.add_argument("--no-fp16", action="store_true",
                         help="Disable fp16 (use if GPU doesn't support it)")
+    parser.add_argument("--log-file", type=str, default=None,
+                        help="Save all output to this file (default: finetune/logs/{run_name}.txt)")
     args = parser.parse_args()
 
     query_mode = args.query_mode
-    run_name = args.run_name or f"scenario-{query_mode}"
+    model_type = args.model
+    mcfg = get_model_config(model_type)
+    run_name = args.run_name or f"{model_type}-{query_mode}"
     output_dir = Path(cfg.train.models_root) / run_name
-    data_dir = Path(cfg.data.prepared_data_root) / query_mode
+    data_dir = Path(cfg.data.prepared_data_root) / model_type / query_mode
+    log_file = args.log_file or f"finetune/logs/{run_name}.txt"
+    setup_logger(log_file)
 
     num_epochs = args.epochs or cfg.train.num_epochs
     batch_size = args.batch_size or cfg.train.batch_size
 
     print(f"\n{'='*60}")
-    print(f"  Fine-tuning — mode: {query_mode}  run: {run_name}")
+    print(f"  Fine-tuning — mode: {query_mode}  model: {model_type}  run: {run_name}")
+    print(f"  Base model: {mcfg.base_model}")
     print(f"  Data:   {data_dir}")
     print(f"  Output: {output_dir}")
     print(f"  Epochs: {num_epochs}  Batch: {batch_size}  LR: {cfg.train.learning_rate}")
@@ -129,8 +141,8 @@ def main():
     train_dataset = ds["train"].select_columns(["anchor", "positive"])
 
     # --- Load model (ShawhinT approach) ---
-    print(f"\n[2/4] Loading base model: {cfg.model.base_model}")
-    model = SentenceTransformer(cfg.model.base_model)
+    print(f"\n[2/4] Loading base model: {mcfg.base_model}")
+    model = SentenceTransformer(mcfg.base_model)
 
     # Reduce max sequence length to save VRAM
     # Legal texts are long but 256 tokens covers most article snippets
@@ -162,12 +174,20 @@ def main():
 
     # --- Val evaluator ---
     print("\n[3/4] Building val evaluator (English queries → German docs)...")
+    # For prompt-name models (gemma), look up the actual prompt text from the model
+    q_prefix = mcfg.query_prefix
+    p_prefix = mcfg.passage_prefix
+    if mcfg.query_prompt_name and mcfg.query_prompt_name in model.prompts:
+        q_prefix = model.prompts[mcfg.query_prompt_name]
+    if mcfg.passage_prompt_name and mcfg.passage_prompt_name in model.prompts:
+        p_prefix = model.prompts[mcfg.passage_prompt_name]
+
     evaluator = build_val_evaluator(
         val_csv=cfg.data.val_csv,
         laws_csv=cfg.data.laws_csv,
         court_csv=cfg.data.court_csv,
-        query_prefix=cfg.model.query_prefix,
-        passage_prefix=cfg.model.passage_prefix,
+        query_prefix=q_prefix,
+        passage_prefix=p_prefix,
     )
 
     # --- Effective batch size via gradient accumulation ---
@@ -177,6 +197,14 @@ def main():
     grad_accum = max(1, 16 // batch_size)  # target effective batch of 16
     print(f"\n  Batch per device: {batch_size}  ×  grad_accum: {grad_accum}"
           f"  =  effective batch: {batch_size * grad_accum}")
+
+    # For prompt-name models, pass prompts to training args so trainer applies them
+    train_prompts = None
+    if mcfg.query_prompt_name:
+        train_prompts = {
+            "anchor": model.prompts.get(mcfg.query_prompt_name, ""),
+            "positive": model.prompts.get(mcfg.passage_prompt_name, ""),
+        }
 
     # --- Training args (ShawhinT structure + NVIDIA hyperparams) ---
     train_args = SentenceTransformerTrainingArguments(
@@ -203,7 +231,8 @@ def main():
         dataloader_pin_memory=False,
         dataloader_drop_last=True,    # avoid DDP hang on uneven last batch
         report_to="none",
-        save_only_model=True,         # skip optimizer state — saves ~4GB disk per checkpoint
+        save_only_model=True,
+        prompts=train_prompts,        # None for e5 (uses raw text); prompt dict for gemma
     )
 
     # --- Train (ShawhinT: SentenceTransformerTrainer) ---

@@ -33,15 +33,43 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
-    # Multilingual, strong cross-lingual alignment, ~560M params
     base_model: str = "intfloat/multilingual-e5-large"
 
-    # Required prefixes for multilingual-e5 (from NVIDIA recipe)
+    # Prefix-based models (e.g. multilingual-e5): prepend to text before encoding
     query_prefix: str = "query: "
     passage_prefix: str = "passage: "
 
-    # 128 covers 93.9% of corpus docs (mean=57 tokens); hardcoded in 02_finetune.py
-    max_seq_length: int = 256
+    # Prompt-name models (e.g. EmbeddingGemma): use model.encode(prompt_name=...)
+    # If non-empty, prompt_name takes priority over prefix
+    query_prompt_name: str = ""
+    passage_prompt_name: str = ""
+
+    max_seq_length: int = 128
+
+
+# --- Available model configs ---
+MODEL_CONFIGS: dict[str, ModelConfig] = {
+    "e5-large": ModelConfig(
+        base_model="intfloat/multilingual-e5-large",
+        query_prefix="query: ",
+        passage_prefix="passage: ",
+        max_seq_length=128,
+    ),
+    "gemma": ModelConfig(
+        base_model="google/embeddinggemma-300m",
+        query_prefix="",
+        passage_prefix="",
+        query_prompt_name="retrieval.query",
+        passage_prompt_name="retrieval.passage",
+        max_seq_length=128,
+    ),
+}
+
+
+def get_model_config(model_type: str) -> ModelConfig:
+    if model_type not in MODEL_CONFIGS:
+        raise ValueError(f"Unknown model '{model_type}'. Choose from: {list(MODEL_CONFIGS)}")
+    return MODEL_CONFIGS[model_type]
 
 
 @dataclass
@@ -67,5 +95,5 @@ class FinetuneConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
 
 
-# Singleton for easy import
+# Singleton for easy import (defaults to e5-large)
 cfg = FinetuneConfig()
