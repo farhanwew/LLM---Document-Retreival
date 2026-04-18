@@ -142,11 +142,12 @@ def build_val_evaluator(val_csv: str, laws_csv: str, court_csv: str,
                 corpus[cit] = citation_to_text[cit]
                 relevant_docs[qid].add(cit)
 
-    # Add distractor docs for realistic evaluation
-    pos_cits = set(corpus.keys())
-    distractors = [c for c in citation_to_text if c not in pos_cits][:5000]
-    for cit in distractors:
-        corpus[cit] = citation_to_text[cit]
+    # Use all laws_de docs as corpus — 5000 distractors was too small (gave inflated F1)
+    # and didn't reflect real inference difficulty (176k docs). This aligns training
+    # evaluation with actual inference conditions so best-checkpoint selection is meaningful.
+    for cit, text in citation_to_text.items():
+        if cit not in corpus:
+            corpus[cit] = text
 
     print(f"  Val evaluator: {len(queries)} queries, {len(corpus):,} corpus docs")
 
@@ -280,13 +281,28 @@ def main():
     print(f"\n  Batch per device: {batch_size}  ×  grad_accum: {grad_accum}"
           f"  =  effective batch: {batch_size * grad_accum}")
 
-    # For prompt-name models, pass prompts to training args so trainer applies them
-    train_prompts = None
+    # Pass prompts/prefixes to trainer so they are applied consistently during training.
+    # Without this, e5-large trains on raw text but evaluates/infers with "query: "/"passage: "
+    # prefixes — causing representation mismatch and performance regression.
     if mcfg.query_prompt_name:
+        # Gemma-style: prompt names
         train_prompts = {
             "anchor": model.prompts.get(mcfg.query_prompt_name, ""),
             "positive": model.prompts.get(mcfg.passage_prompt_name, ""),
         }
+        if "negative" in train_cols:
+            train_prompts["negative"] = model.prompts.get(mcfg.passage_prompt_name, "")
+    elif mcfg.query_prefix:
+        # e5-style: string prefixes
+        train_prompts = {
+            "anchor": mcfg.query_prefix,
+            "positive": mcfg.passage_prefix,
+        }
+        if "negative" in train_cols:
+            train_prompts["negative"] = mcfg.passage_prefix
+    else:
+        train_prompts = None
+    print(f"  Train prompts: {train_prompts}")
 
     # --- Training args (ShawhinT structure + NVIDIA hyperparams) ---
     train_args = SentenceTransformerTrainingArguments(

@@ -77,7 +77,7 @@ class TrainConfig:
     models_root: str = "finetune/models"
 
     # Hyperparams: ShawhinT framework + NVIDIA values
-    num_epochs: int = 5
+    num_epochs: int = 3
     batch_size: int = 16  # per-device; seq_len=128 makes e5-large fit on P100 16GB
     learning_rate: float = 1e-5        # NVIDIA: 1e-5 for large models
     warmup_ratio: float = 0.1          # ShawhinT: 0.1
