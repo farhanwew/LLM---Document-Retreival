@@ -59,9 +59,9 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
         base_model="google/embeddinggemma-300m",
         query_prefix="",
         passage_prefix="",
-        query_prompt_name="retrieval.query",
-        passage_prompt_name="retrieval.passage",
-        max_seq_length=128,
+        query_prompt_name="Retrieval-query",
+        passage_prompt_name="Retrieval-document",
+        max_seq_length=256,
     ),
 }
 

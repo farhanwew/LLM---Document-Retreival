@@ -232,6 +232,7 @@ def main():
         dataloader_drop_last=True,    # avoid DDP hang on uneven last batch
         report_to="none",
         save_only_model=True,
+        save_total_limit=2,           # keep only best + latest checkpoint to save disk
         prompts=train_prompts,        # None for e5 (uses raw text); prompt dict for gemma
     )
 
