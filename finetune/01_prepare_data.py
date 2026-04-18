@@ -246,8 +246,10 @@ def mine_hard_negatives(
     corpus_embs = np.concatenate(corpus_embs, axis=0)
 
     print("  Mining hard negatives...")
-    # Build query → hard negatives map
-    top_k = hard_neg_per_query * 10  # retrieve more, filter down
+    # Candidate pool: large enough to always find hard_neg_per_query non-positives.
+    # The old top_k=40 was too small — cosine scores cluster tightly so the margin
+    # check eliminated almost all candidates. Using 200 gives a wide enough pool.
+    top_k = max(hard_neg_per_query * 50, 200)
     query_to_hardnegs = {}
 
     # Score in row-chunks to avoid OOM on large query × corpus matrix
@@ -261,16 +263,15 @@ def mine_hard_negatives(
         row_scores = scores[i]
         top_indices = np.argsort(row_scores)[::-1][:top_k]
         pos_texts = pos_set_per_query.get(q, set())
-        top_score = row_scores[top_indices[0]]
 
+        # Take highest-scoring non-positive docs as hard negatives.
+        # The old margin check (doc_score > top_score * 0.95 → skip) was comparing
+        # against the top-1 retrieved doc rather than the gold positive, causing
+        # nearly all candidates to be rejected when scores cluster tightly.
         hard_negs = []
         for idx in top_indices:
             doc_text = corpus_texts[idx]
-            doc_score = row_scores[idx]
-            # Skip true positives and near-duplicate scores (NVIDIA margin check)
             if doc_text in pos_texts:
-                continue
-            if doc_score > top_score * hard_neg_margin:
                 continue
             hard_negs.append(doc_text)
             if len(hard_negs) >= hard_neg_per_query:
