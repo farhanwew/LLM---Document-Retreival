@@ -43,22 +43,19 @@ from finetune.logger import setup_logger
 # Helpers
 # ---------------------------------------------------------------------------
 
-def load_corpus(laws_path: str, court_path: str) -> dict[str, str]:
-    """Build citation → text lookup from corpus files. Pass empty string to skip a file."""
-    parts = []
-    for path in [laws_path, court_path]:
-        if not path:
-            continue
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            parts.append(df[["citation", "text"]].dropna())
-            print(f"  Loaded {len(df):,} rows from {path}")
-        else:
-            print(f"  WARNING: {path} not found, skipping")
-    if not parts:
+def load_corpus(path: str) -> dict[str, str]:
+    """Build citation → text lookup from a CSV file (concatenated/clean or raw)."""
+    if not path or not os.path.exists(path):
+        print(f"  WARNING: {path} not found or empty, skipping")
         return {}
-    corpus_df = pd.concat(parts, ignore_index=True)
-    return dict(zip(corpus_df["citation"], corpus_df["text"]))
+    
+    df = pd.read_csv(path)
+    # If using corpus_clean.csv, it has 'citation' and 'text'. 
+    # If court_considerations.csv, it might have duplicates (handled by dictionary overwrite - NOT IDEAL).
+    # We prefer the clean one.
+    df = df[["citation", "text"]].dropna()
+    print(f"  Loaded {len(df):,} rows from {path}")
+    return dict(zip(df["citation"], df["text"]))
 
 
 def expand_pairs(train_df: pd.DataFrame, corpus: dict[str, str]) -> tuple[list, list, int]:
@@ -184,7 +181,7 @@ def mine_hard_negatives(
     print(f"  Loading model for hard negative mining...")
 
     model = SentenceTransformer(model_name, device=device)
-    model.max_seq_length = 128
+    model.max_seq_length = 512
 
     # Adjust batch size for CPU (much smaller to avoid slowness spiral)
     encode_batch = mining_batch_size if device == "cuda" else 16
@@ -364,8 +361,17 @@ def main():
 
     # --- 2. Load corpus ---
     print("[2/5] Loading corpus...")
-    corpus = load_corpus(cfg.data.laws_csv, cfg.data.court_csv)
-    print(f"  Total corpus size: {len(corpus):,} citations")
+    # Preferred: concatenated/clean corpus from preprocess.ipynb
+    if os.path.exists(cfg.data.corpus_clean_csv):
+        print(f"  Using clean/concatenated corpus: {cfg.data.corpus_clean_csv}")
+        corpus = load_corpus(cfg.data.corpus_clean_csv)
+    else:
+        print(f"  WARNING: Clean corpus not found at {cfg.data.corpus_clean_csv}")
+        print("  Falling back to raw laws + court (may have dictionary overwrites for chunks)")
+        corpus_laws = load_corpus(cfg.data.laws_csv)
+        corpus_court = load_corpus(cfg.data.court_csv)
+        corpus = {**corpus_laws, **corpus_court}
+    print(f"  Total corpus size: {len(corpus):,} unique citations")
 
     # --- 3. Expand pairs ---
     print("[3/5] Building (query, positive) pairs...")
@@ -373,60 +379,69 @@ def main():
     total = len(queries_orig) + missed
     print(f"  Pairs built: {len(queries_orig):,} / {total:,} (missed {missed:,} citations not in corpus)")
 
-    # --- Build smart mining corpus ---
-    # Strategy (from user insight + data.md):
-    #   1. All gold citations from train.csv  → pasti relevan, harus ada (~3-5k unik)
-    #   2. All laws_de.csv                   → hanya 175k, manageable, semua pasal relevan
-    #   3. court_considerations: data.md says "you can start without this" — skip or small sample
-    # Total: ~180k vs 2.16M sebelumnya
-    gold_texts = set(positives)  # teks dari gold citations yang sudah matched
-    laws_corpus = load_corpus(cfg.data.laws_csv, "")  # laws saja
-    mining_corpus = dict(laws_corpus)  # mulai dari semua laws (175k)
-    # Pastikan semua gold citation texts masuk ke mining corpus
-    for cit, text in corpus.items():
-        if text in gold_texts:
-            mining_corpus[cit] = text
-    court_sample = args.court_sample
-    if court_sample > 0 and os.path.exists(cfg.data.court_csv):
-        court_df = pd.read_csv(cfg.data.court_csv, nrows=court_sample).dropna(subset=["citation", "text"])
-        for _, row in court_df.iterrows():
-            if row["citation"] not in mining_corpus:
-                mining_corpus[row["citation"]] = row["text"]
-        print(f"  Added {court_sample:,} court docs sample to mining corpus")
-    print(f"  Smart mining corpus: {len(mining_corpus):,} docs "
-          f"(gold citations + all laws + {court_sample:,} court sample)")
-
-    # --- 4. Build query variants ---
-    # Store raw text (no prefixes/prompts) — applied at training time
+    # --- 4. Build query variants (with optimization mapping) ---
     print(f"[4/5] Building query variants (mode={query_mode})...")
-    final_queries, final_positives = [], []
-
-    if query_mode in ("original", "both"):
-        final_queries.extend(queries_orig)
-        final_positives.extend(positives)
-        print(f"  Added {len(queries_orig):,} original-language pairs")
-
+    
+    # query_map: original_query -> translated_query (None if not translating)
+    query_map = {q: None for q in set(queries_orig)}
+    
     if query_mode in ("translated", "both"):
         print("  Translating queries to English...")
-        queries_en = translate_queries(
-            queries_orig,
+        unique_orig = list(query_map.keys())
+        unique_en = translate_queries(
+            unique_orig,
             cache_path=cfg.data.translation_cache,
             model_name=cfg.data.translation_model,
             batch_size=cfg.data.translation_batch_size,
         )
-        final_queries.extend(queries_en)
-        final_positives.extend(positives)
-        print(f"  Added {len(queries_en):,} English-translated pairs")
+        for orig, en in zip(unique_orig, unique_en):
+            query_map[orig] = en
 
-    print(f"  Total pairs: {len(final_queries):,}")
+    # final_training_pairs: list of (semantic_anchor, positive_text, original_query_for_mining)
+    # We always mine based on the original query (German) and apply results to translations.
+    # This ensures consistency and saves half the mining compute in 'both' mode.
+    training_rows = []
+    for q_orig, p in zip(queries_orig, positives):
+        if query_mode in ("original", "both"):
+            training_rows.append({"anchor": q_orig, "positive": p, "mine_key": q_orig})
+        if query_mode in ("translated", "both"):
+            training_rows.append({"anchor": query_map[q_orig], "positive": p, "mine_key": q_orig})
+    
+    print(f"  Total training rows to be expanded: {len(training_rows):,}")
 
     # --- 5. Mine hard negatives ---
     mine = cfg.data.mine_hard_negatives and not args.no_hard_negatives
     if mine:
         print("[5/5] Mining hard negatives...")
-        final_queries, final_positives, negatives = mine_hard_negatives(
-            queries=final_queries,
-            positives=final_positives,
+        
+        # Build mining corpus logic (Smart Mining)
+        # Use clean laws + gold citations as base for efficiency
+        gold_texts = set(positives)
+        mining_corpus = {}
+        # 1. Add all laws (usually high quality distractors)
+        if os.path.exists(cfg.data.laws_csv):
+            mining_corpus.update(load_corpus(cfg.data.laws_csv))
+        # 2. Add all gold positives from training
+        for cit, text in corpus.items():
+            if text in gold_texts:
+                mining_corpus[cit] = text
+        
+        print(f"  Smart mining corpus: {len(mining_corpus):,} docs (gold citations + laws)")
+
+        # Unique queries to mine (the original ones)
+        queries_to_mine = list(query_map.keys())
+        # We need a dummy positive for each unique query to mine
+        # (just pick one, used to filter self-positives)
+        dummy_positives = []
+        q_to_all_pos = {}
+        for q, p in zip(queries_orig, positives):
+            q_to_all_pos.setdefault(q, []).append(p)
+        for q in queries_to_mine:
+            dummy_positives.append(q_to_all_pos[q][0])
+
+        _, _, mined_negatives_list = mine_hard_negatives(
+            queries=queries_to_mine,
+            positives=dummy_positives,
             corpus=mining_corpus,
             model_name=mcfg.base_model,
             hard_neg_per_query=cfg.data.hard_neg_per_query,
@@ -439,9 +454,42 @@ def main():
             passage_prompt_name=mcfg.passage_prompt_name,
             max_corpus_docs=len(mining_corpus),
         )
+
+        # Map unique queries back to their mined negatives
+        # Since mine_hard_negatives returns expanded lists, we need to re-group
+        # Actually, let's modify mine_hard_negatives to return a DICT q -> list[neg] 
+        # or just handle the expanded output.
+        # WAIT: mine_hard_negatives expands rows (anchor, pos, neg). 
+        # Let's check its return values again.
+        
+        # NOTE: mine_hard_negatives returns (expanded_q, expanded_p, expanded_n)
+        # We need to map q -> list of negatives.
+        q_to_negs = {}
+        for q, p, n in zip(_, _, mined_negatives_list):
+            if n.strip():
+                q_to_negs.setdefault(q, []).append(n)
+        
+        # Expand final dataset
+        final_queries, final_positives, final_negatives = [], [], []
+        for row in training_rows:
+            negs = q_to_negs.get(row["mine_key"], [])
+            # Cap at max per row
+            negs = negs[:2] 
+            if negs:
+                for n in negs:
+                    final_queries.append(row["anchor"])
+                    final_positives.append(row["positive"])
+                    final_negatives.append(n)
+            else:
+                # No negatives found? Skip or use random? Let's skip to keep quality high.
+                pass
+        
+        print(f"  Final expanded dataset: {len(final_queries):,} rows")
     else:
         print("[5/5] Skipping hard negative mining")
-        negatives = [""] * len(final_queries)
+        final_queries = [row["anchor"] for row in training_rows]
+        final_positives = [row["positive"] for row in training_rows]
+        final_negatives = [""] * len(final_queries)
 
     # Filter rows with empty negatives
     if mine:

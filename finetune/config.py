@@ -13,6 +13,7 @@ class DataConfig:
     val_csv: str = "data/val.csv"
     laws_csv: str = "data/laws_de.csv"
     court_csv: str = "data/court_considerations.csv"
+    corpus_clean_csv: str = "data/corpus_clean.csv"
 
     # --- Output root ---
     prepared_data_root: str = "finetune/prepared_data"
