@@ -168,12 +168,19 @@ def mine_hard_negatives(
     query_prompt_name: str = "",
     passage_prompt_name: str = "",
     max_corpus_docs: int = 100_000,
+    neg_similarity_threshold: float = 0.50,
+    max_negs_per_pair: int = 0,
 ) -> list[str]:
     """
     For each query, retrieve top-K corpus docs, filter true positives, return hard negatives.
 
+    Hard negatives are selected by cosine similarity threshold (not fixed count):
+    only corpus docs with similarity >= neg_similarity_threshold qualify.
+
     Args:
-        hard_neg_margin: docs with similarity > top_score * margin are excluded (NVIDIA: 0.95)
+        hard_neg_margin: (legacy, not used in threshold mode)
+        neg_similarity_threshold: minimum cosine similarity to qualify as hard negative
+        max_negs_per_pair: cap hard negatives per (query, positive) pair. 0 = no cap.
         max_corpus_docs: cap corpus size for mining to avoid OOM / excessive time on CPU
     """
     device = get_device()
@@ -242,45 +249,51 @@ def mine_hard_negatives(
         corpus_embs.append(emb)
     corpus_embs = np.concatenate(corpus_embs, axis=0)
 
-    print("  Mining hard negatives...")
-    # Candidate pool: large enough to always find hard_neg_per_query non-positives.
-    # The old top_k=40 was too small — cosine scores cluster tightly so the margin
-    # check eliminated almost all candidates. Using 200 gives a wide enough pool.
-    top_k = max(hard_neg_per_query * 50, 200)
+    print(f"  Mining hard negatives (similarity >= {neg_similarity_threshold})...")
+    # Score all queries against all corpus docs (full cosine sim matrix).
+    # Threshold-based selection: keep all non-positive docs with similarity >= threshold.
+    top_k = 500  # large enough pool to catch all above-threshold docs
     query_to_hardnegs = {}
 
     # Score in row-chunks to avoid OOM on large query × corpus matrix
-    chunk_size_q = 256  # score 256 queries at a time
+    chunk_size_q = 256
     scores = np.empty((len(unique_queries), len(corpus_texts)), dtype=np.float32)
     for start in range(0, len(unique_queries), chunk_size_q):
         end = min(start + chunk_size_q, len(unique_queries))
         scores[start:end] = query_embs[start:end] @ corpus_embs.T
 
+    min_negatives = 3  # always take at least this many regardless of threshold
     for i, q in enumerate(unique_queries):
         row_scores = scores[i]
-        top_indices = np.argsort(row_scores)[::-1][:top_k]
         pos_texts = pos_set_per_query.get(q, set())
 
-        # Take highest-scoring non-positive docs as hard negatives.
-        # The old margin check (doc_score > top_score * 0.95 → skip) was comparing
-        # against the top-1 retrieved doc rather than the gold positive, causing
-        # nearly all candidates to be rejected when scores cluster tightly.
+        # Sort descending and take top_k (wide enough to catch threshold qualifiers)
+        top_indices = np.argsort(row_scores)[::-1][:top_k]
+
+        # Scheme: minimum {min_negatives} always, plus all extra docs above threshold.
+        # Step 1: gather top {min_negatives} non-positive docs (guaranteed minimum).
+        # Step 2: continue scanning while similarity >= threshold to grab extras.
         hard_negs = []
         for idx in top_indices:
             doc_text = corpus_texts[idx]
             if doc_text in pos_texts:
                 continue
             hard_negs.append(doc_text)
-            if len(hard_negs) >= hard_neg_per_query:
-                break
+            if len(hard_negs) >= min_negatives and row_scores[idx] < neg_similarity_threshold:
+                break  # minimum met and now below threshold → stop
         query_to_hardnegs[q] = hard_negs
 
+        n_above = int((row_scores >= neg_similarity_threshold).sum())
+        if n_above > top_k:
+            print(f"  WARNING: {q[:60]}... has {n_above} docs >= {neg_similarity_threshold} "
+                  f"(only scanned top {top_k}). Increase top_k if missing candidates.")
+
     # Expand rows: each hard negative becomes its own (anchor, positive, negative) row.
-    # Cap at 2 per pair to keep dataset size manageable within Kaggle 12h budget.
-    max_negs_per_pair = 2
     expanded_queries, expanded_positives, expanded_negatives = [], [], []
     for q, p in zip(queries, positives):
-        negs = query_to_hardnegs.get(q, [])[:max_negs_per_pair]
+        negs = query_to_hardnegs.get(q, [])
+        if max_negs_per_pair and max_negs_per_pair > 0:
+            negs = negs[:max_negs_per_pair]
         if negs:
             for neg in negs:
                 expanded_queries.append(q)
@@ -425,8 +438,18 @@ def main():
         for cit, text in corpus.items():
             if text in gold_texts:
                 mining_corpus[cit] = text
-        
-        print(f"  Smart mining corpus: {len(mining_corpus):,} docs (gold citations + laws)")
+
+        # 3. Add random court docs if requested
+        if args.court_sample > 0 and os.path.exists(cfg.data.court_csv):
+            court_df = pd.read_csv(cfg.data.court_csv, usecols=["citation", "text"]).dropna()
+            court_df = court_df[~court_df["citation"].isin(mining_corpus)]
+            if len(court_df) > args.court_sample:
+                court_df = court_df.sample(n=args.court_sample, random_state=42)
+            for _, row in court_df.iterrows():
+                mining_corpus[row["citation"]] = row["text"]
+            print(f"  Added {len(court_df):,} random court docs (--court-sample {args.court_sample})")
+
+        print(f"  Smart mining corpus: {len(mining_corpus):,} docs (gold citations + laws + court sample)")
 
         # Unique queries to mine (the original ones)
         queries_to_mine = list(query_map.keys())
@@ -439,7 +462,7 @@ def main():
         for q in queries_to_mine:
             dummy_positives.append(q_to_all_pos[q][0])
 
-        _, _, mined_negatives_list = mine_hard_negatives(
+        mined_queries, _, mined_negatives_list = mine_hard_negatives(
             queries=queries_to_mine,
             positives=dummy_positives,
             corpus=mining_corpus,
@@ -453,6 +476,8 @@ def main():
             query_prompt_name=mcfg.query_prompt_name,
             passage_prompt_name=mcfg.passage_prompt_name,
             max_corpus_docs=len(mining_corpus),
+            neg_similarity_threshold=cfg.data.neg_similarity_threshold,
+            max_negs_per_pair=cfg.data.max_negs_per_pair,
         )
 
         # Map unique queries back to their mined negatives
@@ -465,24 +490,26 @@ def main():
         # NOTE: mine_hard_negatives returns (expanded_q, expanded_p, expanded_n)
         # We need to map q -> list of negatives.
         q_to_negs = {}
-        for q, p, n in zip(_, _, mined_negatives_list):
+        for q, n in zip(mined_queries, mined_negatives_list):
             if n.strip():
                 q_to_negs.setdefault(q, []).append(n)
         
         # Expand final dataset
         final_queries, final_positives, final_negatives = [], [], []
+        row_cap = cfg.data.max_negs_per_pair if cfg.data.max_negs_per_pair > 0 else None
         for row in training_rows:
             negs = q_to_negs.get(row["mine_key"], [])
-            # Cap at max per row
-            negs = negs[:2] 
+            if row_cap:
+                negs = negs[:row_cap] 
             if negs:
                 for n in negs:
                     final_queries.append(row["anchor"])
                     final_positives.append(row["positive"])
                     final_negatives.append(n)
             else:
-                # No negatives found? Skip or use random? Let's skip to keep quality high.
-                pass
+                final_queries.append(row["anchor"])
+                final_positives.append(row["positive"])
+                final_negatives.append("")
         
         print(f"  Final expanded dataset: {len(final_queries):,} rows")
     else:
@@ -494,7 +521,7 @@ def main():
     # Filter rows with empty negatives
     if mine:
         before = len(final_queries)
-        valid = [(q, p, n) for q, p, n in zip(final_queries, final_positives, negatives) if n.strip()]
+        valid = [(q, p, n) for q, p, n in zip(final_queries, final_positives, final_negatives) if n.strip()]
         final_queries, final_positives, negatives = zip(*valid) if valid else ([], [], [])
         final_queries, final_positives, negatives = list(final_queries), list(final_positives), list(negatives)
         print(f"  Kept {len(final_queries):,} / {before:,} expanded rows with valid hard negatives")

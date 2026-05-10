@@ -9,7 +9,7 @@ from typing import Literal
 @dataclass
 class DataConfig:
     # --- Input data paths (download from Kaggle first) ---
-    train_csv: str = "data/train.csv"
+    train_csv: str = "data/train_filtered.csv"
     val_csv: str = "data/val.csv"
     laws_csv: str = "data/laws_de.csv"
     court_csv: str = "data/court_considerations.csv"
@@ -21,15 +21,17 @@ class DataConfig:
     # --- Translation ---
     # Helsinki-NLP/opus-mt-mul-en handles DE/FR/IT → EN, offline-capable (~300MB)
     translation_model: str = "Helsinki-NLP/opus-mt-mul-en"
-    translation_cache: str = "finetune/translation_cache.json"
+    translation_cache: str = "finetune/cache/translation_cache_qwen.json"
     translation_batch_size: int = 32
 
     # --- Hard negative mining (NVIDIA NeMo concept) ---
     mine_hard_negatives: bool = True
     hard_neg_per_query: int = 4        # 1 pos + 4 neg = 5 passages per query (NVIDIA: train_n_passages=5)
-    hard_neg_margin: float = 0.95      # From NVIDIA config
+    neg_similarity_threshold: float = 0.50  # minimum cosine similarity to qualify as hard negative
+    hard_neg_margin: float = 0.95      # From NVIDIA config (legacy, not used in threshold mode)
     mining_batch_size: int = 512  # no backprop during mining → can use large batch
     corpus_chunk_size: int = 100_000    # From NVIDIA config
+    max_negs_per_pair: int = 0          # cap hard negatives per (q, pos) pair. 0 = no cap.
 
 
 @dataclass
